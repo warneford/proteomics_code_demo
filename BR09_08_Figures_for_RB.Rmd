@@ -1,0 +1,922 @@
+---
+title: "BR09_02.Reannotation of peptides"
+author: "Robert Warneford-Thomsom"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) { 
+      out_dir <- file.path(dirname(dirname(inputFile)), "Reports");
+      if (!dir.exists(out_dir)) dir.create(out_dir);
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(out_dir,
+                        paste0(tools::file_path_sans_ext(basename(inputFile)), ".html")))
+                        })
+   #directs html output to 'Reports' folder in parent directory of markdown file
+---
+
+Knitted on: `r Sys.time()`
+
+# Setup
+
+## Global options + wd
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+homedir <- "/home/rwt"
+Experiment = "BR09.2021.Young.TF.RBRID"
+wd <- paste0(homedir,"/analyses/2021/", Experiment)
+anno.dir <- file.path(wd, "Annotation_Files")
+
+evalFlag = F # option to evaluate all chunks
+```
+
+# Libraries
+
+```{r load libs}
+pacman::p_load(furrr,
+               purrr,
+               tidyverse,
+               tictoc,
+               Biostrings,
+               xlsxjars,
+               xlsx,
+               VennDiagram,
+               gridExtra,
+               future.apply,
+               ggpubr,
+               ggExtra,
+               gtable)
+
+```
+
+## Functions
+
+### RBR-ID functions (RWT)
+
+```{r functions}
+source("/home/rwt/scripts/R/RBRID_functions.R",
+       local = knitr::knit_global(),
+       print.eval = T,
+       max.deparse.length = 10000)
+```
+
+### setupCluster
+```{r setupCluster}
+setupCluster <- function(filenumber, total_cores)
+  #function to set up threads using R packages Future
+  #sets up nested parallel environment where total threads are divided between number of desired threads
+  # can provide either integer number of files or simply list to be processed
+{
+  main_threads = ifelse(is.list(filenumber),length(filenumber),filenumber)
+  sub_threads <- floor(total_cores / main_threads)
+
+  #specify nested parallel threads to allow nested parallel computations
+  #total threads equals length(run_index) * subthreads)
+  future::plan(list(future::tweak(multisession, workers = main_threads),
+            future::tweak(multisession, workers = sub_threads)))
+}
+```
+### my_rename
+
+```{r my_rename}
+#function that allows renaming list elements similarly to dplyr::rename syntax
+my_rename <- function(.x, ..., .strict = TRUE) {
+  pos <- tidyselect::eval_rename(quote(c(...)), .x, strict = .strict)
+  names(.x)[pos] <- names(pos)
+  .x
+}
+```
+
+# RB tables
+
+## Load 220316 Tables from Roberto
+
+```{r RB_tables}
+rb_mESC <- read_delim(file.path(wd, "raw_data/220316.rbrid.mESCs_2016.interpro.tsv"),
+          delim = "\t")
+
+rb_K562 <- read_delim(file.path(wd, "raw_data/220316.rbrid.K562.interpro.tsv"),
+          delim = "\t")
+
+old_K562_TFs <- rb_K562 %>% 
+  filter(peptides_detected > 2 & !is.na(whitehead_TF) & whitehead_TF != "") %>%
+  pull(whitehead_TF)  %>% 
+  unique()
+
+peplist <- readRDS(file.path(wd, "rds", "BR09_02_anno.IPR.wh.quant.rds"))
+
+new_K562_TFs <- peplist$K562 %>% 
+  filter(peptides_detected > 2 & !is.na(whitehead_TF) & whitehead_TF != "") %>%
+  pull(whitehead_TF)  %>% 
+  unique()
+
+new_K562_TFs[!new_K562_TFs %in% old_K562_TFs]
+old_K562_TFs[!old_K562_TFs %in% new_K562_TFs]
+
+```
+
+## Files for Fig1 previous analysis DBD overlap
+
+```{r DBD_overlap}
+#peptides into list
+rbpeps <- list(mESC = rb_mESC,
+               K562 = rb_K562)
+
+# Load Interpro DBD table
+Interpro_DBD.table <- read.xlsx2(
+  file.path(anno.dir, "220309 DBD Interpro table.xlsx"),
+  sheetIndex = 1)
+
+rbpeps <- lapply(rbpeps, function(rbrid){
+  
+  #annotate TF peptides that overlap Interpro DBDs
+  #initialize column as 0, but set "none in protein" for proteins lacking any known IPR DBD
+  rbrid$interpro_DBD <- lapply(Interpro_DBD.table$IPR_ID,
+                     function(IPR) {
+                       dbd <- Interpro_DBD.table %>%
+                         filter(IPR_ID == IPR) %>% 
+                         pull(Name) %>%
+                         unlist()
+                       out <- rep("", nrow(rbrid))
+                       index_match <- grepl(IPR,
+                                            rbrid$interpro_peptide)
+                       
+                       out[index_match] <- paste(dbd, " ")
+                       return(out)
+                                }) %>%
+    do.call("paste0", .) %>%
+    gsub("\ *$", "", x=.) # add spacer between results
+  
+  return(rbrid)
+})
+rbrid <- rbpeps$K562
+dataset <- "K562"
+
+
+plots <- imap(rbpeps, function(rbrid, dataset) {
+  
+   # extract species information from dataset name
+ if (grepl("K562|HCT116|HepG2", dataset)) {
+    species = "human"
+  } else if (grepl("mESC", dataset)) {
+    species = "mouse"
+  }
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  
+  #annotate RBR hits
+  if (species == "mouse") {
+    rbrid$strict <- rbrid$pval < 0.05 & rbrid$logFold < 0
+  } else {
+    rbrid$strict <- rbrid$padj < 0.05 & rbrid$logFold < 0
+  }
+  
+   #Filter for whitehead TF peptides
+  df <- rbrid %>% 
+    filter(!is.na(whitehead_TF)) %>%
+    filter(peptides_detected > 2) %>% # filter for peptides from proteins with at least 3 peptides
+    filter(strict)  
+  
+  
+
+  Domain.overlaps <- df %>% 
+    filter(strict) %>% 
+    group_by(symbol) %>%
+    summarise(
+      interpro.overlaps = paste0(interpro_DBD, collapse = "|") %>%
+                                      str_split(. , pattern = "\\|") %>%
+                                      unlist() %>%
+                                      .[. != ""] %>%
+                                      length()
+    ) %>% 
+    ungroup()
+  
+  #label DBD overlaps > 2 "3 or more"
+  Domain.overlaps$interpro.overlaps[Domain.overlaps$interpro.overlaps > 2] <- "3 or more"
+  
+  #for symbols that do not contain any IPR DBD, label as none in protein
+  interpro_dbd <- paste0(Interpro_DBD.table$IPR_ID, collapse = "|")
+  
+  none_index <- sapply(Domain.overlaps$symbol, function(symbol) {
+    interpro <- df$interpro_protein[df$symbol == symbol] %>%
+      paste0(.,collapse = "|") %>%
+      str_split(. , pattern = "\\|") %>%
+      unlist() %>%
+      unique() %>%
+      paste0(.,collapse = "|")
+    
+    !grepl(interpro_dbd, interpro)
+    }) %>% which()
+
+  
+  Domain.overlaps$interpro.overlaps[none_index] <- "no annotated DBD"
+  
+  # order factor
+  Domain.overlaps$interpro.overlaps <- factor(Domain.overlaps$interpro.overlaps) %>%
+    fct_relevel(., c("no annotated DBD", "0", "1", "2", "3 or more"))
+  
+  Domain.overlaps <- Domain.overlaps %>%
+    arrange(interpro.overlaps)
+  
+
+y <- ggplot(Domain.overlaps, aes(y="count", fill=interpro.overlaps)) +
+  geom_bar() +
+  theme_bw() + 
+  ylab("") +
+  xlab("number of proteins") +
+  ggtitle(paste0(trim_name, " RBR-ID hit overlap with Interpro DNA-binding Domains\nTF protein hits: ", nrow(Domain.overlaps))) +
+  coord_flip() +
+  scale_fill_manual("number of peptide overlaps", 
+                    values = c("no annotated DBD" = "dodgerblue2",
+                               "0" = "grey",
+                               "1" = "grey44",
+                               "2" = "black",
+                               "3 or more" = "orange")) +
+  theme(axis.text.x=element_blank(),
+        text = element_text(size=10),
+        axis.ticks.x = element_blank())
+return(y)
+})
+
+```
+
+### Fig 1
+```{r Fig1}
+pdf(file.path(wd, "figures", "BR09_08_Fig1_RB_tables_DBD_overlap.pdf"))
+p1 <- ggarrange(plotlist = plots, ncol = 1)
+p1
+dev.off()
+```
+
+### Files for Fig 1.2 (outside DBD)
+```{r prep1.2}
+rbrid <- rbpeps$K562
+dataset <- "K562"
+
+plots <- imap(rbpeps, function(rbrid, dataset) {
+  
+   # extract species information from dataset name
+ if (grepl("K562|HCT116|HepG2", dataset)) {
+    species = "human"
+  } else if (grepl("mESC", dataset)) {
+    species = "mouse"
+  }
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  
+  #annotate RBR hits
+  if (species == "mouse") {
+    rbrid$strict <- rbrid$pval < 0.05 & rbrid$logFold < 0
+  } else {
+    rbrid$strict <- rbrid$padj < 0.05 & rbrid$logFold < 0
+  }
+  
+   #Filter for whitehead TF peptides
+  df <- rbrid %>% 
+    filter(!is.na(whitehead_TF)) %>%
+    filter(peptides_detected > 2) %>% # filter for peptides from proteins with at least 3 peptides
+    filter(strict)  
+  
+  
+  #calculate peptides in each protein that do not overlap DBD
+  Domain.overlaps <- df %>% 
+    filter(strict) %>% 
+    group_by(symbol) %>%
+    summarise(
+      nonDBD = sum(interpro_DBD == "")) %>% 
+    ungroup()
+  
+  #label DBD overlaps 
+  Domain.overlaps$nonDBD[Domain.overlaps$nonDBD > 2] <- "3 or more"
+  
+  #for symbols that do not contain any IPR DBD, label as none in protein
+  interpro_dbd <- paste0(Interpro_DBD.table$IPR_ID, collapse = "|")
+  
+  none_index <- sapply(Domain.overlaps$symbol, function(symbol) {
+    interpro <- df$interpro_protein[df$symbol == symbol] %>%
+      paste0(.,collapse = "|") %>%
+      str_split(. , pattern = "\\|") %>%
+      unlist() %>%
+      unique() %>%
+      paste0(.,collapse = "|")
+    
+    !grepl(interpro_dbd, interpro)
+    }) %>% which()
+
+  
+  Domain.overlaps$nonDBD[none_index] <- "no annotated DBD"
+  
+  # order factor
+  Domain.overlaps$nonDBD <- factor(Domain.overlaps$nonDBD) %>%
+    fct_relevel(., c("3 or more", "2", "1", "0", "no annotated DBD"))
+  
+  labels <- levels(Domain.overlaps$nonDBD)
+  values = c("3 or more" = "orange",
+                               "2" = "black",
+                               "1" = "grey44",
+                               "0" = "grey",
+                               "no annotated DBD" = "dodgerblue2"
+                               )
+  
+  Domain.overlaps <- Domain.overlaps %>%
+    arrange(nonDBD)
+  
+
+y <- ggplot(Domain.overlaps, aes(y="count", fill=nonDBD)) +
+  geom_bar() +
+  theme_bw() + 
+  ylab("") +
+  xlab("number of proteins") +
+  ggtitle(paste0(trim_name, " TF non-DBD RBR-ID hits\nTF protein hits: ", nrow(Domain.overlaps))) +
+  coord_flip() +
+  scale_fill_manual("number of non-DBD peptides",
+                    labels = labels,
+                    values = values[labels]) +
+  theme(axis.text.x=element_blank(),
+        text = element_text(size=10),
+        axis.ticks.x = element_blank())
+return(y)
+})
+```
+
+### Fig 1.2
+```{r Fig1.2}
+pdf(file.path(wd, "figures", "BR09_08_Fig1.2_RB_tables_nonDBD_overlap.pdf"))
+p1 <- ggarrange(plotlist = plots, ncol = 1)
+p1
+dev.off()
+```
+
+### Files for Fig 1.3 (outside DBD | inside DBD | both)
+```{r prep1.3}
+rbrid <- rbpeps$K562
+dataset <- "K562"
+
+plots <- imap(rbpeps, function(rbrid, dataset) {
+ species <- Whatspecies(dataset) 
+ trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  
+  #annotate RBR hits
+  if (species == "mouse") {
+    rbrid$strict <- rbrid$pval < 0.05 & rbrid$logFold < 0
+  } else {
+    rbrid$strict <- rbrid$padj < 0.05 & rbrid$logFold < 0
+  }
+  
+   #Filter for whitehead TF peptides
+  df <- rbrid %>% 
+    filter(!is.na(whitehead_TF)) %>%
+    filter(peptides_detected > 2) %>% # filter for peptides from proteins with at least 3 peptides
+    filter(strict)  
+  
+  
+  #categorize peptides:
+  #1) those with hits only within the DBD
+  #2) those with only outside the DBD
+  #3) those with hits in both
+  Domain.overlaps <- df %>% 
+    filter(strict) %>% 
+    group_by(symbol) %>%
+    summarise(
+      nonDBD = any(interpro_DBD == ""),
+      DBD = any(interpro_DBD != "")) %>%
+    ungroup()
+  
+  #label DBD overlaps
+  # categorize proteins into above groups
+Domain.overlaps <- Domain.overlaps %>%
+    mutate(Domain = case_when(nonDBD & !DBD ~ "All hits outside DBD",
+                              !nonDBD & DBD ~ "All hits inside DBD",
+                              nonDBD & DBD ~ "hits inside and outside DBD")
+    )
+  
+  #for symbols that do not contain any IPR DBD, label as none in protein
+  interpro_dbd <- paste0(Interpro_DBD.table$IPR_ID, collapse = "|")
+  
+  none_index <- sapply(Domain.overlaps$symbol, function(symbol) {
+    interpro <- df$interpro_protein[df$symbol == symbol] %>%
+      paste0(.,collapse = "|") %>%
+      str_split(. , pattern = "\\|") %>%
+      unlist() %>%
+      unique() %>%
+      paste0(.,collapse = "|")
+    
+    !grepl(interpro_dbd, interpro)
+    }) %>% which()
+  
+  
+  
+  Domain.overlaps$Domain[none_index] <- "no annotated DBD"
+  
+  # order factor
+  Domain.overlaps$Domain <- factor(Domain.overlaps$Domain) %>%
+    fct_relevel(., c("All hits outside DBD",
+                     "hits inside and outside DBD",
+                     "All hits inside DBD",
+                     "no annotated DBD"))
+  
+  labels <- levels(Domain.overlaps$Domain)
+  cbp1 <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+  colors <- cbp1
+  colors <- colors[1:length(labels)]
+  names(colors) <- labels
+  
+  Domain.overlaps <- Domain.overlaps %>%
+    arrange(Domain)
+  
+
+y <- ggplot(Domain.overlaps, aes(y="count", fill=Domain)) +
+  geom_bar() +
+  theme_bw() + 
+  ylab("") +
+  xlab("number of proteins") +
+  ggtitle(paste0(trim_name, " TF non-DBD RBR-ID hits\nTF protein hits: ", nrow(Domain.overlaps))) +
+  coord_flip() +
+  scale_fill_manual("number of non-DBD peptides",
+                    labels = labels,
+                    values = colors) +
+  theme(axis.text.x=element_blank(),
+        text = element_text(size=10),
+        axis.ticks.x = element_blank())
+return(y)
+})
+```
+
+### Fig 1.3
+```{r Fig1.3}
+pdf(file.path(wd, "figures", "BR09_08_Fig1.3_RB_tables_DBD_category.pdf"))
+p1 <- ggarrange(plotlist = plots, ncol = 1)
+p1
+dev.off()
+```
+
+# RWT updated analysis
+
+###  Fig 2: TF & RBR overlap (updated analysis)
+```{r venn}
+run_index <- c("K562_E")
+
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+#duplicate mESC for secondary hits
+# names(peplist) <- c("Hela", "Hela_secondary")
+
+venn_plots <- imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+  filt <- rbrid[rbrid$peptides_detected > 2,]  
+  
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  stringency <- "Primary" # primary or secondary hits
+  
+  FDR = T #set FDR comparison as true
+  if (trim_name %in% c("mESC")) {
+    FDR = F
+  }
+  
+  cutoff = 0.05
+  
+  if(grepl("secondary", dataset)){
+    cutoff = 0.1 
+    stringency <- "Primary and secondary"
+  }
+  
+  if (FDR) {
+    filt.hits <- filt %>%
+      filter(log2fold < 0 & padj < cutoff)# then find hits
+  }
+  
+  if (dataset == "mESC") {
+  filt.hits <- filt %>%
+    filter(log2fold < 0 & pval < cutoff)# then find hits
+  }
+
+  # Count number of proteins in various groups
+  n.prot     <- length(unique(filt$uniprotID))
+  n.TFs      <- length(unique(filt$whitehead_TF[filt$whitehead_TF != ""])) 
+  n.hits     <- length(unique(filt.hits$uniprotID))
+  overlap    <- filt.hits %>%
+    filter(whitehead_TF != "") %>%
+    pull(symbol) %>%
+    unique() %>%
+    length()
+
+  # Overlaps
+  pval <- phyper(q = overlap-1,
+                 m = n.hits,
+                 n = n.prot-n.hits,
+                 k = n.TFs,
+                 lower.tail = F) %>%
+    signif(., digits = 3)
+
+  venn <- draw.pairwise.venn(area1 = n.hits,
+                     area2 = n.TFs,
+                     cross.area = overlap,
+                     fill = c("red", "blue"),
+                     alpha = c(0.5,0.5),
+                     category = c(paste0(stringency, " hits"),
+                                  paste0(stringency, " hits TFs (≥3 peptides)")),
+                     scaled = T,
+                     cex = 1,
+                     cat.pos = c(340, 180),
+                     cat.dist = c(0.05, 0.1),
+                     cat.cex = 1,
+                     ind = F)
+  
+  
+  out <- ggarrange(textGrob(paste0("overlap p = ", pval),
+                            gp = gpar(col = "black",
+                                      fontsize = 15)),
+                   venn, 
+                   ncol = 1, nrow = 2,heights = c(1,5))
+
+return(out)
+})
+
+ggarrange(plotlist = venn_plots[2],
+          ncol =1,
+          nrow=1)
+```
+
+## Fig3 updated DBD overlap
+
+```{r DBD_overlap_fig}
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+rbrid <- peplist[[run_index[2]]]
+dataset <- run_index[1]
+
+DBD_plots <- imap(peplist, function(rbrid, dataset) {
+   # extract species information from dataset name
+ 
+  species <- Whatspecies(dataset)
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  if(trim_name == "Hela"){
+    cutoff = 0.1 
+  } else {cutoff = 0.05}
+  
+  #annotate RBR hits
+  if (species == "mouse") {
+    rbrid$strict <- rbrid$pval < cutoff & rbrid$log2fold < 0
+  } else {
+    rbrid$strict <- rbrid$padj < cutoff & rbrid$log2fold < 0
+  }
+  
+   #Filter for whitehead TF peptides
+  df <- rbrid %>% 
+    filter(whitehead_TF != "") %>%
+    filter(peptides_detected > 2) %>% # filter for peptides from proteins with at least 3 peptides
+    filter(strict)  
+
+  Domain.overlaps <- df %>% 
+    group_by(whitehead_TF) %>%
+    summarise(interpro.overlaps = sum(interpro_DBD != ""),
+              protein_contains_DBD = any(protein_contains_DBD)) # use any to include protein isoforms
+  
+  #label DBD overlaps > 2 "3 or more"
+  Domain.overlaps$interpro.overlaps[Domain.overlaps$interpro.overlaps > 2] <- "3 or more"
+  
+  #for symbols that do not contain any IPR DBD, label as none in protein
+  Domain.overlaps$interpro.overlaps[!Domain.overlaps$protein_contains_DBD] <- "no annotated DBD"
+  
+  # order factor
+  Domain.overlaps$interpro.overlaps <- factor(Domain.overlaps$interpro.overlaps) %>%
+    fct_relevel(., c("no annotated DBD", "0", "1", "2", "3 or more"))
+  
+  Domain.overlaps <- Domain.overlaps %>%
+    arrange(interpro.overlaps)
+  
+
+y <- ggplot(Domain.overlaps, aes(y="count", fill=interpro.overlaps)) +
+  geom_bar() +
+  theme_bw() + 
+  ylab("") +
+  xlab("number of proteins") +
+  ggtitle(paste0("TF protein hits: ", nrow(Domain.overlaps))) +
+  coord_flip() +
+  scale_fill_manual("number of peptide overlaps", 
+                    values = c("no annotated DBD" = "dodgerblue2",
+                               "0" = "grey",
+                               "1" = "grey44",
+                               "2" = "black",
+                               "3 or more" = "orange")) +
+  theme(axis.text.x=element_blank(),
+        text = element_text(size=10),
+        axis.ticks.x = element_blank())
+return(y)
+})
+
+p1 <- ggarrange(plotlist = DBD_plots, ncol = 1)
+
+annotate_figure(p1, top = textGrob("RBR-ID hit overlap with Interpro DNA-binding Domains", gp = gpar(col = "black", fontsize = 20)))
+```
+
+## Fig4 volcano plots
+```{r volcano_prep}
+#load data
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+# RNA binding domain ids
+RRM="IPR000504"
+KH="IPR004087"
+dsRBD="IPR014720"
+ploop="IPR027417"
+RBDs<- paste(RRM,KH,dsRBD, sep = "|")
+
+Volcano_plots <- imap(peplist, function(rbrid, dataset) {
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  FDR = T
+  if (dataset == "mESC" ) {
+    FDR = F
+  }
+  
+      #filter peptides for proteins with at least 3 peptides
+    df <- rbrid %>%
+      filter(peptides_detected > 2)
+    
+    # do not use FDR for mESC dataset
+    if (FDR) {
+       df <- df %>%
+      mutate(log10_pval = -log10(padj))
+      ylab <- "-log10 adj. p-value"
+      xlimits <- c(3,3)
+    } else {
+      df <- df %>%
+        mutate(log10_pval = -log10(pval))
+      ylab <- "-log10 p-value"
+      xlimits <- c(-5,5)
+    }
+  #initialize annotation
+  df$Domain <- "all other peptides"
+  
+  #plot volcano plot for RBDs, ploop, and TFs
+  index <- c(RBDs= "RBD",
+             ploop="P-Loop",
+             TFs="TF peptide")
+  
+  subplots <- map(index, function(subject){
+  
+  if (subject == "RBD") {
+    df$Domain[grepl(RBDs, df$interpro_peptide)] <- "RBD"
+    color = "red"
+    
+  } else if (subject == "P-Loop") {
+    df$Domain[grepl(ploop, df$interpro_peptide)] <- "P-Loop"
+    color = "blue"
+    
+  } else if (subject == "TF peptide") {
+    TF_ind <- which(df$whitehead_TF != "")
+    df$Domain[TF_ind] <- "TF peptide"
+    color = "red"
+  }
+    df$Domain <- fct_relevel(df$Domain, "all other peptides") #reorder levels
+    
+    my_colors <- c("grey", color)
+    names(my_colors) <- levels(df$Domain)
+    g <- ggplot(df %>% arrange(Domain),
+              aes(x = log2fold,
+                  y = log10_pval,
+                  col = Domain)) +
+    theme_classic() +
+    geom_point(alpha = 0.1, size =4) +
+    scale_color_manual("",
+                       values = my_colors,
+                       breaks = subject) +
+    xlab("Log2 fold change (+/- 4sU)") +
+    ylab(ylab) +
+    geom_hline(yintercept = -log10(0.05), linetype = 2, size = 0.4) +
+    geom_vline(xintercept = 0, linetype = 2, size = 0.4) +
+    xlim(-5, 5) + 
+    ylim(0,7) +
+     theme(text = element_text(size=10),
+          legend.position = "top") +
+    guides(color=guide_legend(override.aes=list(alpha=1))) #make legend color opaque
+  
+  z <- ggMarginal(g,type = "density",groupColour = T, margins = "x",
+                    geom_vline(xintercept = 0, linetype = 2, size = 0.4))
+    #add vertical dashed line to gtable object with density plot
+    vline <- ggplot() +
+      geom_vline(xintercept = 0, linetype = 2, size = 0.4) + #create dashed line
+      theme_void() 
+      vgrob <- ggplotGrob(vline) #convert to grob
+      #use gtable_add_grob to add vertical line grob to object, plot underneath with z
+      z$grobs[[20]] <- gtable_add_grob(z$grobs[[20]], vgrob, t=1, l=1, z = -Inf) 
+      
+      return(z)})
+  
+  return(subplots)
+  })
+
+p1 <- ggarrange(plotlist = Volcano_plots[[1]], nrow = 1)
+p1
+```
+
+## Fig 5 rank plot 
+
+```{r Rank Plot, eval = T}
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+rankplots <- future_imap(peplist, function(rbrid, dataset) {
+  
+  # make a temp copy to modify and fill missing symbols with uniprot IDs  
+  rbrid.temp <- rbrid[rbrid$peptides_detected > 2, ]
+  rbrid.temp$symbol[rbrid.temp$symbol==""] <- rbrid.temp$uniprotID[rbrid.temp$symbol==""]
+
+  # generate protein-level RBR-ID score list
+  red.flat <- rbrid.temp %>%
+    group_by(symbol) %>%
+    arrange(-score) %>%
+    slice_head(n = 1)  %>% # keep the max RBR-ID per each protein
+    ungroup() %>%
+    arrange(score) %>%# Resort based on RBR-ID score %>%
+  mutate(type  = factor(case_when(whitehead_TF != "" ~ "TFs",
+                   TRUE ~ "All protein"), levels = c("All protein", "TFs")))
+  red.flat$rank <- 1:nrow(red.flat) # assign rank
+  
+# ranked plot
+p <- ggplot(red.flat %>%
+              mutate(type = "All protein"), aes(x = rank, y = score)) +
+  geom_point(size = 3, aes(col = type), show.legend = F) +
+  geom_point(data = red.flat %>%
+               filter(type == "TFs") %>%
+               arrange(type),
+             mapping = aes(col = type), size = 7, alpha = 0.1) +
+  scale_color_manual("", labels = c("All protein", "TFs"),
+                     values = c("grey", "navy")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 0.5))) + # override alpha for legend
+  theme_bw() +
+  ylab("RBR-ID score") +
+  xlab("Rank") +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank()) +
+  ggtitle(paste0("Ranked plot of max RBR-ID score per protein")) +
+  theme(plot.title = element_text(hjust = 0.5)) +
+  theme(legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"),
+        text = element_text(size=10),
+        legend.title = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+
+  if(dataset == "mESC") {
+    p <- p + 
+      scale_y_continuous(limits = c(-10, 120), breaks = base::seq(0, 100, 20))
+  }
+  
+
+return(p)
+})
+
+p1 <- ggarrange(plotlist = rankplots[2], nrow = 1)
+```
+
+### Fig 6: CDF of TF RBR-ID scores
+
+```{r CDF, eval = evalFlag}
+# Prepare CDF data frames by normalizing their length
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+cdfplots <- future_imap(peplist, function(rbrid, dataset) {
+  
+  # make a temp copy to modify and fill mising symbols with uniprot IDs  
+  rbrid.temp <- rbrid[rbrid$peptides_detected > 2, ]
+  rbrid.temp$symbol[rbrid.temp$symbol==""] <-
+    rbrid.temp$uniprotID[rbrid.temp$symbol==""]
+
+  # generate protein-level RBR-ID score list
+  red.flat <- rbrid.temp %>%
+    group_by(symbol) %>%
+    arrange(-score) %>%
+    slice_head(n = 1)  %>% # keep the max RBR-ID per each protein
+    ungroup() %>%
+    arrange(score) %>%# Resort based on RBR-ID score %>%
+  mutate(type  = factor(case_when(whitehead_TF != "" ~ "TFs",
+                   TRUE ~ "All protein"), levels = c("All protein", "TFs")))
+  red.flat$rank <- 1:nrow(red.flat) # assign rank
+
+#sort score by ascending order
+red.flat <- red.flat %>% 
+  arrange(score) %>%
+  mutate(fraction = 1:length(score)/length(score))
+
+TFdata <-  red.flat %>%
+              filter(type == "TFs") %>%
+              mutate(fraction = 1:length(score)/length(score))
+
+g <- ggplot(red.flat, aes(x = score, y = fraction)) +
+  geom_line(data = red.flat %>%
+              mutate(type = "All Proteins"),
+            aes(col = type)) +
+  geom_line(data = TFdata, aes(col = type), size = 1.3) +
+  theme_classic() +
+  ylab("Fraction of set") +
+  xlab("RBR-ID score") +
+  ggtitle("Ranked plot of max RBR-ID score per protein")+
+  scale_color_manual(values = c("grey", "blue")) +
+  scale_y_continuous(limits = c(0, 1), breaks = base::seq(0,1,0.2)) +
+  coord_cartesian(xlim =c(-1,floor(TFdata$score[which(TFdata$fraction > 0.97)[1]]))) +
+  theme(legend.background = element_blank(),
+        legend.box.background = element_rect(colour = "black"),
+        text = element_text(size=10),
+        legend.title = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA))
+
+ if(dataset == "mESC") {
+    # g <- g + 
+    #   scale_x_continuous(limits = c(-1, 17), breaks = base::seq(0, 15, 5))
+ }
+
+  if(dataset == "HepG2") {
+    g <- g + 
+      scale_x_continuous(limits = c(-2, 6), breaks = base::seq(-1, 5, 1))
+ }
+
+return(g)})
+
+ggarrange(plotlist = cdfplots, nrow = 2)
+
+```
+
+
+## Arrange Figures
+```{r arrange}
+purrr::map(run_index, function(experiment) {
+
+  #extract plots
+  master <- list(volcano = Volcano_plots,
+                 venn = venn_plots,
+                 dbd = DBD_plots,
+                 rank = rankplots,
+                 cdf = cdfplots)
+  subset <- map(master, experiment) #extract graph for each experiment
+  
+# pdf(file.path(wd, "figures", paste0("BR09_08_", experiment, "_RBRID.pdf")),
+#     width = 8.5,
+#     height = 11,
+#     title = paste0("BR09_08_", experiment, "_RBRID"))
+grid.arrange(grobs = c(subset$volcano, subset[2:5]),
+             layout_matrix = matrix(c(1,1,2,2,3,3,
+                                      4,4,4,5,5,5,
+                                      6,6,6,7,7,7),
+                                    ncol = 6,
+                                    nrow = 3,
+                                    byrow = T),
+             widths = c(1,1,1,1,1,1),
+             heights = c(3,3,3))
+# dev.off()
+})
+```
+
+# Output table for collaborators
+```{r output_table, eval = evalFlag}
+# run_index <- "HepG2"
+
+peplist <- readRDS(file.path(wd, "rds", "BR09_02_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+imap(peplist, function(rbrid, dataset) {
+  species <- Whatspecies(dataset)
+  
+outputCols <- c("uniprotID",
+"symbol",
+"whitehead_TF",
+"synonyms",
+"name",
+"sequence",
+"start",
+"end",
+"interpro_peptide",
+"interpro_protein",
+"interpro_DBD",
+"peptides_detected",
+"test_used",
+"pval",
+"padj",
+"logFold",
+"score")
+  
+  if (species == "mouse") {
+    outputCols <- outputCols[outputCols!= "padj"]
+  }
+  
+rbrid <- rbrid %>%as
+  arrange(-score) %>%
+  filter(!is.na(whitehead_TF))
+# Select columns that they need and give them easier to interpret names
+
+out <- rbrid %>% select(all_of(outputCols))
+                        
+
+# Save to TSV
+write.table(out, file.path(wd, paste0("output/220519.TF.DBD.", dataset, ".table.tsv")), quote = F, row.names = F, sep = "\t")
+
+return(NULL)
+})
+```

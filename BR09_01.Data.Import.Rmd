@@ -1,0 +1,922 @@
+---
+title: "BR09_01 | Importing RBR-ID data for analysis of TF RNA binding (Whitehead collaboration)"
+author: "Robert Warneford-Thomson"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) { 
+    out_dir <- file.path(dirname(dirname(inputFile)), "Reports");
+    if (!dir.exists(out_dir)) dir.create(out_dir);
+    rmarkdown::render(inputFile,
+                      encoding=encoding, 
+                      output_file=file.path(out_dir,
+                      paste0(tools::file_path_sans_ext(basename(inputFile)), ".html")))
+                      })  
+#directs html output to 'Reports' folder in parent directory of markdown file
+---
+
+Knitted on: `r Sys.time()`
+
+# Setup
+
+## Markdown Options / wd
+
+Knitr options and working folder
+
+```{r setup}
+homedir <- "/home/rwt"
+Experiment = "BR09.2021.Young.TF.RBRID"
+wd <- paste0(homedir,"/analyses/2021/", Experiment)
+
+knitr::opts_chunk$set(echo = TRUE)
+
+# set a new output hook to truncate text output
+
+#set root directory
+knitr::opts_knit$set(root.dir=wd)
+
+if (dir.exists(file.path(wd, "rds"))) print(paste0("Directory ", wd, "rds already exists")) else dir.create(file.path(wd, "rds"))
+```
+
+## Global options
+
+```{r global options}
+options(stringsAsFactors = FALSE)
+cores = 20 # for multi-threaded functions on brainberg3 
+evalFlag = T #specify whether to evaluate all chunks
+```
+
+## Libraries
+
+```{r load libs}
+pacman::p_load(furrr,
+               purrr,
+               tidyverse,
+               reshape2,
+               devtools,
+               ggpubr,
+               gridExtra,
+               ggExtra,
+               Biostrings,
+               hexbin,
+               VennDiagram,
+               grid)
+```
+
+## Functions
+
+### RWT RBR-ID functions
+
+```{r Functions}
+source("/home/rwt/scripts/R/RBRID_functions.R", 
+       local = knitr::knit_global(),
+       echo = T, 
+       max.deparse.length=100000)
+
+#color blind palette
+cbp1 <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+```
+
+# Import Data
+
+## Import K562 (RWT-190)
+
+```{r import_K562, eval = T}
+peplist <- list()
+
+#import injections 1, 2, and 3
+K562_files <- c(K562_exp1_DIA_t1 = "220202_K562_RWT190_DIA_injection1.tsv",
+                K562_exp1_DIA_t2 = "220208_K562_Redo_report.pr_matrix.tsv",
+                K562_exp1_DIA_t3 = "220307_RWT_190_K562_peptides_t3_report.pr_matrix.tsv")
+
+
+df.list <- lapply(K562_files, function(path){
+  read_delim(file.path(wd, "raw_data", path),
+             delim = "\t",
+             escape_backslash = T)
+})
+ 
+#merge replicates (join data with all annotations stripped, then add it back)
+merged.data <- lapply(df.list, function(df){
+  df %>%
+    select(Stripped.Sequence:last_col())
+  }) %>%
+  purrr::reduce(full_join)
+
+# create annotation df (keep only single annotation per peptide, will remap later)
+anno.df <- lapply(df.list, function(df){
+  df %>%
+    select(1:Stripped.Sequence) %>%
+    group_by(Stripped.Sequence) %>%
+    slice_head(n = 1)
+  }) %>%
+  purrr::reduce(full_join) %>% #remove duplicate annotations for merged peptides
+  select(1:Stripped.Sequence) %>%
+  group_by(Stripped.Sequence) %>%
+  slice_head(n = 1)
+
+#add metadata
+raw_K562_merged <- full_join(anno.df, merged.data)
+
+#rename sample names
+colAnnot <- sapply(names(raw_K562_merged), function(col) {
+  gsub(col, pattern = ".*220131.*Nuclei_DIA_(\\d+)\\.raw", replacement = "K562.exp1.\\1.t1") %>% #trim data col
+    gsub(col, pattern = ".*220206.*Nuclei_DIA_(\\d+)\\.raw", replacement = "K562.exp1.\\1.t2") %>% #trim data col
+    gsub(col, pattern = ".*220226_190_(\\d+)_2\\.raw", replacement = "K562.exp1.\\1.t3") %>% #trim
+    gsub(pattern = "([1|2|3|4|5]\\.t\\d)", replacement = "minus.\\1")  %>% #4SU treatment
+    gsub(pattern = "(([6|7|8|9]|10)\\.t\\d)", replacement = "plus.\\1")
+}
+, USE.NAMES = F)
+
+names(raw_K562_merged) <- colAnnot
+
+clean_K562 <- raw_K562_merged %>%
+  dplyr::rename(uniprotID = Protein.Group,
+         symbol = Genes,
+         sequence = Stripped.Sequence,
+         name = First.Protein.Description,
+         unique = Proteotypic,
+         modified_sequence = Modified.Sequence,
+         charge = Precursor.Charge,
+         precursor_id = Precursor.Id)
+
+peplist$K562_exp1_DIA <- clean_K562
+
+rm(df.list, anno.df, merged.data, colAnnot, raw_K562_merged, K562_files, clean_K562)
+```
+
+## Import K562 (RWT-190) (RWT re-search)
+
+```{r import_K562, eval = T}
+#import injections 1, 2, and 3
+K562_files <- c(K562_exp1_DIA_rwtDIA = "report.pr_matrix.tsv")
+
+
+df.list <- lapply(K562_files, function(path){
+  read_delim(file.path(wd, "DiaNN_analysis/RWT-190/output", path),
+             delim = "\t",
+             escape_backslash = T)
+})
+ 
+#merge replicates (join data with all annotations stripped, then add it back)
+merged.data <- lapply(df.list, function(df){
+  df %>%
+    select(Stripped.Sequence:last_col())
+  }) %>%
+  purrr::reduce(full_join)
+
+# create annotation df (keep only single annotation per peptide, will remap later)
+anno.df <- lapply(df.list, function(df){
+  df %>%
+    select(1:Stripped.Sequence) %>%
+    group_by(Stripped.Sequence) %>%
+    slice_head(n = 1)
+  }) %>%
+  purrr::reduce(full_join) %>% #remove duplicate annotations for merged peptides
+  select(1:Stripped.Sequence) %>%
+  group_by(Stripped.Sequence) %>%
+  slice_head(n = 1)
+
+#add metadata
+raw_K562_merged <- full_join(anno.df, merged.data)
+
+#rename sample names
+colAnnot <- sapply(names(raw_K562_merged), function(col) {
+  gsub(col, pattern = ".*220131.*Nuclei_DIA_(\\d+)\\.mzML", replacement = "K562.exp1.\\1.t1") %>% #trim data col
+    gsub(col, pattern = ".*220206.*Nuclei_DIA_(\\d+)\\.mzML", replacement = "K562.exp1.\\1.t2") %>% #trim data col
+    gsub(col, pattern = ".*220226_190_(\\d+)_2\\.mzML", replacement = "K562.exp1.\\1.t3") %>% #trim
+    gsub(pattern = "([1|2|3|4|5]\\.t\\d)", replacement = "minus.\\1")  %>% #4SU treatment
+    gsub(pattern = "(([6|7|8|9]|10)\\.t\\d)", replacement = "plus.\\1")
+}
+, USE.NAMES = F)
+
+names(raw_K562_merged) <- colAnnot
+
+clean_K562 <- raw_K562_merged %>%
+  dplyr::rename(uniprotID = Protein.Group,
+         symbol = Genes,
+         sequence = Stripped.Sequence,
+         name = First.Protein.Description,
+         unique = Proteotypic,
+         modified_sequence = Modified.Sequence,
+         charge = Precursor.Charge,
+         precursor_id = Precursor.Id)
+
+peplist$K562_exp1_DIA_rwtDIA <- clean_K562
+
+rm(df.list, anno.df, merged.data, colAnnot, raw_K562_merged, K562_files, clean_K562)
+```
+
+## Import K562 (RWT-193)
+
+```{r import_K562_exp2, eval = T}
+#import experiment 2 
+K562_files <- c(K562_exp2_DIA = "220420_report.K562.pr_matrix_RWT193.tsv",
+                K562_exp2_DDA = "220414_RBRID_DDA_193_1-(1)_PeptideGroups.txt")
+
+df.list <- lapply(K562_files, function(path){
+  read_delim(file.path(wd, "raw_data", path),
+             delim = "\t",
+             escape_backslash = T,
+             name_repair = "universal")
+})
+#load DDA file descriptions
+DDA_table <- read_delim(file.path(wd, "raw_data", "220414_RBRID_DDA_193_1-(1)_InputFiles.txt"),
+             delim = "\t",
+             escape_backslash = T, name_repair = "universal") %>%
+  .[-1,] #drop first line
+
+#trim DDA 
+df.list$K562_exp2_DDA <- df.list$K562_exp2_DDA %>%
+  dplyr::select(sequence = Annotated.Sequence,
+                num_PSMs = ..PSMs,
+                starts_with("Abundances")) %>%
+  mutate(sequence = gsub(pattern = ".*\\]\\.(\\w+)\\.\\[.*", #remove cleaved residues
+                         replacement = "\\1",
+                         x = sequence)) 
+
+# add sample information to DDA data
+names(df.list$K562_exp2_DDA) <- names(df.list$K562_exp2_DDA) %>%
+  map_chr(., function(.x) {
+    if(!grepl("Abundances",.x)) {return(.x)}
+    ID = gsub(pattern = "Abundances.*(F\\d+)", "\\1", .x)
+    DDA_table$File.Name[DDA_table$Study.File.ID == ID]
+    })
+
+#rename sample names
+df.list <- imap(df.list, function(df, type) {
+  df <- df %>%
+    dplyr::rename_with(~ gsub(pattern = ".*193_", "", .)) %>%
+    dplyr::rename_with(~ gsub(pattern = "([12])_(\\d+)\\.raw", "K562.exp2.b\\2.t\\1", .)) %>%
+    dplyr::rename_with(~ gsub(pattern = "(b[1||3||5|7|9]\\.t\\d)", replacement = "minus.\\1", .))  %>% #4SU
+    dplyr::rename_with(~ gsub(pattern = "(b([2|4|6|8]|10)\\.t\\d)", replacement = "plus.\\1", .)) 
+  
+  if (grepl("DIA", type)) {
+  df <- df %>%
+    dplyr::rename(uniprotID = Protein.Group,
+                  symbol = Genes,
+                  sequence = Stripped.Sequence,
+                  name = First.Protein.Description,
+                  unique = Proteotypic,
+                  modified_sequence = Modified.Sequence,
+                  charge = Precursor.Charge,
+                  precursor_id = Precursor.Id) %>%
+    dplyr::mutate(across(matches("unique"), as.logical))
+  }
+  
+  return(df)
+  })
+
+peplist <- c(peplist, df.list)
+```
+
+## Import K562 (RWT-194)
+```{r import_K562_exp3, eval = T}
+#import experiment 3
+K562_files <- c(K562_exp3_DIA = "report.pr_matrix.tsv")
+
+df.list <- lapply(K562_files, function(path){
+  read_delim(file.path(homedir, "analyses/2021/BR09.2021.Young.TF.RBRID/DiaNN_analysis/RWT-194/output",
+                       path),
+             delim = "\t",
+             escape_backslash = T,
+             name_repair = "universal")
+})
+
+#rename sample names
+df.list <- map(df.list, function(df) {
+  out <- df %>%
+    dplyr::rename_with(~ gsub(pattern = ".*194_([0-9]{1,2}_[ABC]_[12]).*", "\\1", .)) %>%
+    dplyr::select(1:Precursor.Id, sort(colnames(.))) %>%
+    dplyr::rename_with(~ gsub(pattern = "([0-9]{1,2})_([ABC])_([12])", "K562.exp3.b\\1.\\2.t\\3", .)) %>%
+    dplyr::rename_with(~ gsub(pattern = "(b[1||3||5|7|9]\\.[ABC]\\.t\\d)", replacement = "minus.\\1", .))  %>% #4SU
+    dplyr::rename_with(~ gsub(pattern = "(b([2|4|6|8]|10)\\.[ABC]\\.t\\d)", replacement = "plus.\\1", .)) %>%
+    dplyr::rename_with(~ gsubfn::gsubfn(pattern = "b(1|2|3|4|5|6|7|8|9|10)\\.",
+                                      ~ paste0("b", if_else(as.numeric(x)%%2 == 0,as.numeric(x)/2, (as.numeric(x)+1)/2), "."), x = .)) %>%
+    
+    dplyr::rename_with(~ gsub("Stripped.Sequence","sequence",.)) %>% #rename DIA unique columns
+    dplyr::rename_with(~ gsub("Proteotypic","unique",.)) %>%
+    dplyr::mutate(across(matches("unique"), as.logical)) 
+  return(out)
+  })
+
+#divide experiment RWT-194 into 3 experimental conditions based on sonication treatment
+split <- c(K562_exp3_DIA_std_sonication = "A",
+           K562_exp3_DIA_4xsonication = "B")
+           #K562_exp3_DIA_covaris = "C")
+
+split_data <- map(split, function(tag){
+  df.list$K562_exp3_DIA %>%
+    dplyr::select(1:Precursor.Id, grep(paste0("K562.*\\.",tag,"\\.t[12]"),
+                                       x = colnames(.),
+                                       value = T))
+})
+
+peplist <- c(peplist, split_data)
+
+```
+### QC: DIA charge states
+
+I will test if different charge states for same peptides show similar depletion
+
+```{r K562_charge_states, eval = F}
+df <- peplist$K562
+datcols <- c(grep("minus", names(df), value = T),
+  grep("plus", names(df), value = T))
+
+#Filter for peptides with more than one charge state
+dup_peps <- df$sequence[duplicated(df$sequence)] %>% unique()
+multi_peps <- df[df$sequence %in% dup_peps,]
+
+# find the distribution of charge states
+charge_freq <- df$sequence %>% table() %>% as_tibble()
+pct_df <- charge_freq %>%
+            group_by(n) %>%
+            dplyr::count(name = "count") %>%
+            mutate(pct = round(count/nrow(charge_freq)*100, digits = 2))
+# plot charge state distribution of peptides
+ggplot(charge_freq, aes(n)) +
+  geom_bar(stat = "count") +
+  theme_bw() +
+  ylab("Number of peptides") +
+  scale_x_discrete("Number of charge states", limits = factor(1:max(charge_freq$n))) +
+  geom_label(aes(n), data = pct_df, label = paste0(pct_df$pct, "%"), y = log10(pct_df$count)) +
+  scale_y_log10()+
+  ggtitle("Distribution of charge state number ")
+
+rm(charge_freq, pct_df)
+```
+
+From this plot it seems that bulk of multi-charge peptides have only 2 charge states
+
+### QC: Charge state correlation
+I will try plotting the correlation between 2 most abundant charge states for each unique multi-charge peptide
+
+```{r multi charge correlation, eval = F}
+#extract 2 most abundant charge states based on average intensity
+multi_peps$avg_Int <- rowMeans(multi_peps[,datcols],na.rm = T)
+topCharge_states <- multi_peps %>%
+  group_by(sequence) %>%
+  arrange(-avg_Int) %>%
+  slice_head(n = 2) %>%
+  arrange(sequence)
+
+topCharge_states$charge_state <- rep(c("state_1", "state_2"), nrow(topCharge_states)/2)
+
+#I will compare the abundances between charge states for all separate peptide/replicate observations
+ChargeAbundances <- reshape2::melt(topCharge_states,
+                              id.vars=c("charge_state","sequence"),
+                              measure.vars = datcols)
+castCharge <- reshape2::dcast(ChargeAbundances, sequence~variable+charge_state)
+
+#combine peptide observations into 2 columns
+mergedCharge <- tibble(sequence = rep(castCharge$sequence, 30),
+                       state_1 = castCharge[,grep("state_1", names(castCharge))] %>% unlist(),
+                       state_2 = castCharge[,grep("state_2", names(castCharge))] %>% unlist())
+
+#remove observations with NA values
+mergedCharge <- filter_all(mergedCharge, all_vars(!is.na(.)))
+source_gist("524eade46135f6348140") # source smoothing function
+ggplot(mergedCharge, aes(x=state_1,y=state_2)) +
+  geom_point(alpha=0.01) +
+  scale_x_log10() +
+  scale_y_log10() +
+  theme_bw() +
+  stat_smooth_func(geom="text",method="lm",hjust=0,parse=TRUE) +
+  geom_smooth(method='lm', se=F) +
+  ggtitle("Peptide abundances of top 2 charge states in each peptide/replicate observation")
+
+rm(mergedCharge, castCharge, ChargeAbundances)
+```
+
+From this analysis it seems that the top charge states correlate well. Going forward I will sum the various charge states before proceeding
+
+## Import HCT116 (RWT-191)
+
+```{r import_HCT, eval = T}
+#import injections 1 and 2
+#import injections 1, 2, and 3
+HCT116_files <- c(t1 = "220306_RWT_191_HCT116_peptides_t1_report-first-pass.pr_matrix.tsv",
+                  t2 = "220306_RWT_191_HCT116_peptides_t2_report.pr_matrix.tsv")
+
+df.list <- lapply(HCT116_files, function(path){
+  read_delim(file.path(wd, "raw_data", path),
+             delim = "\t",
+             escape_backslash = T)
+})
+
+#merge replicates (join data with all annotations stripped, then add it back)
+merged.data <- lapply(df.list, function(df){
+  df %>%
+    select(Stripped.Sequence:last_col())
+  }) %>%
+  purrr::reduce(full_join)
+
+# create annotation df (keep only single annotation per peptide, will remap later)
+anno.df <- lapply(df.list, function(df){
+  df %>%
+    select(1:Stripped.Sequence) %>%
+    group_by(Stripped.Sequence) %>%
+    slice_head(n = 1)
+  }) %>%
+  purrr::reduce(full_join) %>% #remove duplicate annotations for merged peptides
+  select(1:Stripped.Sequence) %>%
+  group_by(Stripped.Sequence) %>%
+  slice_head(n = 1)
+
+#add metadata
+raw_HCT116_merged <- full_join(anno.df, merged.data)
+
+#rename sample names
+colAnnot <- sapply(names(raw_HCT116_merged), function(col) {
+  #trim data cols
+  gsub(col, pattern = ".*(HCT116)", replacement = "\\1.exp1.") %>% #trim data col
+    gsub(col, pattern = "\\..*220224_191_(\\d+)\\.raw", replacement = ".\\1.t1") %>%
+    gsub(col, pattern = "\\..*220226_191_(\\d+).*", replacement = ".\\1.t2")  %>%
+    #label minus and plus 4SU samples
+    gsub(pattern = "([1|2|3|4|5]\\.t\\d)", replacement = "minus.\\1")  %>% #4SU treatment
+    gsub(pattern = "(([6|7|8|9]|10)\\.t\\d)", replacement = "plus.\\1")
+}, USE.NAMES = F)
+
+colnames(raw_HCT116_merged) <- colAnnot
+
+clean_HCT116 <- raw_HCT116_merged %>%
+  dplyr::rename(uniprotID = Protein.Group,
+         symbol = Genes,
+         sequence = Stripped.Sequence,
+         name = First.Protein.Description,
+         unique = Proteotypic,
+         modified_sequence = Modified.Sequence,
+         charge = Precursor.Charge,
+         precursor_id = Precursor.Id)
+
+peplist$HCT116 <- clean_HCT116
+
+rm(anno.df, df.list,merged.data, colAnnot, raw_HCT116_merged, HCT116_files, clean_HCT116)
+```
+
+## Import mESC (mol cell 2016)
+
+```{r import_mESC, eval = T}
+raw_mESC <- readRDS("/home/rwt/from_roberto/2.E14.50runs.raw.IPR.rds") %>%
+  as_tibble() %>%
+  # remove columns
+  select(-pepID, 
+         -prot_IPR_hits,
+         -pept_IPR_hits) %>%
+  # drop 254 and 365 nm data columns
+  select(!contains("254")) %>%
+  select(!contains("noUV")) %>%
+  select(!contains("365")) 
+
+#rename columns
+raw_mESC <- raw_mESC %>%
+  rename_with(., ~ gsub(".no4SU.", ".minus_4SU.", .x, fixed = T)) %>%
+  rename_with(., ~ gsub(".4SU.", ".plus_4SU.", .x, fixed = T))
+
+peplist$mESC <- raw_mESC
+
+# duplicate data to compare normalization (deprecated)
+# peplist$K562_rwt <- peplist$K562
+# peplist$mESC_rwt <- peplist$mESC 
+
+rm(raw_mESC)
+```
+
+## Import HepG2 (RWT-192)
+
+1 April 2022
+```{r import_HegG2, eval = T}
+#import injections 1 and 2 
+HepG2_file <- c(HepG2 = "HEPG2_peptide_report.pr_matrix.tsv")
+
+df.list <- lapply(HepG2_file, function(path){
+  read_delim(file.path(wd, "raw_data", path),
+             delim = "\t",
+             escape_backslash = T)
+})
+
+raw_HepG2 <- df.list$HepG2
+
+#rename sample names
+colAnnot <- sapply(names(raw_HepG2), function(col) {
+  #trim data cols
+    gsub(col, pattern = "(.*RWT192_Nuclei_DIA)", replacement = "Exp1.") %>%
+    gsub(pattern = "(Exp1\\._\\d+)\\.raw", replacement = "\\1.t1") %>%
+    gsub(pattern = "(Exp1\\.)_2_(\\d+)\\.raw", replacement = "\\1_\\2.t2") %>%
+    gsub(pattern = "([1|2|3|4|5]\\.t\\d)", replacement = "minus.\\1")  %>% #4SU treatment
+    gsub(pattern = "(([6|7|8|9]|10)\\.t\\d)", replacement = "plus.\\1")
+}
+, USE.NAMES = F)
+colnames(raw_HepG2) <- colAnnot
+
+clean_HepG2 <- raw_HepG2 %>%
+  select(uniprotID = Protein.Group,
+         symbol = Genes,
+         sequence = Stripped.Sequence,
+         name = First.Protein.Description,
+         unique = Proteotypic,
+         modified_sequence = Modified.Sequence,
+         charge = Precursor.Charge,
+         precursor_id = Precursor.Id,
+         contains("minus"),
+         contains("plus"))
+
+#sort data columns
+datcols <- grep("minus|plus", colAnnot,
+                   value = T)
+sortcol <- datcols[gsub("[^0-9]+", "", datcols) %>% #numerical sort data columns
+                  as.numeric() %>%
+                  order() ]
+
+
+clean_HepG2 <- clean_HepG2 %>%
+  select(-contains("minus") & -contains("plus"), 
+         all_of(sortcol))
+
+peplist$HepG2 <- clean_HepG2
+
+saveRDS(peplist, file.path(wd,"rds", "BR09_01.rawpep.list.RDS"))
+
+rm(df.list, colAnnot, raw_HepG2, clean_HepG2)
+```
+
+
+
+## Import HeLa (Lauman)
+
+14 April 2022
+```{r import_Hela, eval = T}
+#import injections 1 and 2 
+Hela_files <- c(files = "190423_PARASAIL_PTMHunt_FineAdjustments_InputFiles.txt",
+                peptides = "190423_PARASAIL_PTMHunt_FineAdjustments_PeptideGroups.txt",
+                proteins = "190423_PARASAIL_PTMHunt_FineAdjustments_Proteins.txt",
+                statistics = "190423_PARASAIL_PTMHunt_FineAdjustments_ResultStatistics.txt")
+
+
+df.list <- map(Hela_files, function(path){
+  raw <- read_delim(file.path(homedir, "from_roberto/220413_HeLa_SILAC_RBRID", path),
+             delim = "\t",
+             escape_backslash = T)
+  out <- raw %>% 
+  rename_all(tolower) %>% 
+  rename_all(~str_replace_all(., "\\W", "_"))
+})
+
+raw_Hela <- df.list$peptides %>%
+  dplyr::select(-contains("ratio")) %>%
+  dplyr::select(uniprotID = master_protein_accessions,
+                protein_name = master_protein_descriptions,
+                sequence,
+                contaminant,
+                contains("abundance_"))
+
+#rename sample names
+raw_Hela <- raw_Hela %>%
+  dplyr::rename_with(~ gsub(pattern = ".*(f\\d.*(heavy|light)).*", "\\1", .)) %>%
+  dplyr::rename_with(~ gsub(pattern = "f([1-6])(_.*)", "cyto\\2_b\\1", .)) %>% #cytoplasm
+  dplyr::rename_with(~ gsub(pattern = "f(7|8|9|10|11|12)(_.*)", "nuc\\2_b\\1", .)) %>% #nuclei
+  dplyr::rename_with(~ gsub(pattern = "f(7|8|9|10|11|12)(_.*)", "nuc\\2_b\\1", .))
+
+anno_Hela <- raw_Hela %>%
+  dplyr::rename_with(~ gsubfn::gsubfn(pattern = "b(1|2|3|7|8|9)$",
+                                      ~ paste0("HFX_b", if_else(as.numeric(x)%%3 == 0,3,as.numeric(x)%%3)), x = .)) %>%
+  dplyr::rename_with(~ gsubfn::gsubfn(pattern = "b(4|5|6|10|11|12)$",
+                                      ~ paste0("fusion_b", if_else(as.numeric(x)%%3 == 0,3,as.numeric(x)%%3)), x = .)) %>%
+  dplyr::rename_with(~ gsub("(light)", "\\1_minus", .)) %>%
+  dplyr::rename_with(~ gsub("(heavy)", "\\1_plus", .))
+
+#remove contaminants
+anno_Hela <- anno_Hela %>%
+  filter(!contaminant) %>%
+  dplyr::select(-contaminant) # drop column
+
+#remove additional contaminants from custom list
+
+#split into nuclear and cytoplasmic
+peplist$Hela_cyto <- anno_Hela %>%
+  dplyr::select(uniprotID:sequence,
+                contains("cyto"))
+
+peplist$Hela_nuc <- anno_Hela %>%
+  dplyr::select(uniprotID:sequence,
+                contains("nuc"))
+
+saveRDS(peplist, file.path(wd,"rds", "BR09_01.rawpep.list.RDS"))
+
+rm(Hela_files, df.list, raw_Hela, anno_Hela)
+```
+
+# Set up Parallel
+
+```{r run_index}
+#species datasets to re-annotate
+peplist <- readRDS(file.path(wd,"rds", "BR09_01.rawpep.list.RDS"))
+
+#combine with NPC data
+NPClist <- readRDS(file.path(wd,"rds", "BR09_01.NPC.rawpep.list.RDS"))
+
+peplist <- c(peplist, NPClist)
+
+#load K562 re-analysis J (see BR09_11)
+peplist$K562_exp1_DIA_rwtSearch <- readRDS(file.path(wd,"rds", "BR09_11.rawpep.contam.list.RDS"))[["J"]]
+
+#total cores to use
+cores <- 60
+
+# set up subthreads for nested parallelization, where applicable
+setupCluster(length(peplist), total_cores = cores)
+
+saveRDS(peplist, file.path(wd,"rds", "BR09_01.rawpep.with_NPC.list.RDS"))
+
+rm(NPClist)
+```
+
+# Contaminants
+
+label peptides matching contaminant protein sequences
+
+```{r contaminants, eval =F}
+peplist <- readRDS(file.path(wd,"rds", "BR09_01.rawpep.with_NPC.list.RDS"))
+
+con_list <- readRDS(file.path("/home/rwt/genomes/mass_spectrometry_contaminants/220415.combined.contaminant.fasta.list"))
+tic("Marking contaminants")
+cleanpeps <- future_imap(peplist, function(df, dataset) {
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  #rename contaminant column if present, coerce to logical
+  df <- df %>%
+    rename_with(~gsub(".*contaminant.*", "contaminant", ., ignore.case = T))
+  
+  # coerce to logical
+  if(any(names(df) %in% "contaminant")) {
+    df <- mutate(df, contaminant = as.logical(contaminant))
+  }
+
+  # find peptide sequences that align to list of contaminant proteins
+  df$contam_hits <-future_map_lgl(df$sequence,
+                               ~ any(vcountPattern(.x, con_list) > 0)
+                               )
+  #keep existing contaminant column, mark as contaminant if found previously or against custom contam_hits
+    if(any(names(df) %in% "contaminant")) {
+      df <- df %>%
+        mutate(contaminant = contaminant | contam_hits) %>%
+        dplyr::select(-contam_hits)
+    } else {
+      df <- df %>%
+        dplyr::rename(contaminant = contam_hits)
+    }
+  
+  # for silac datasets, use an additional filter to identify contaminants, proteins that only appear in light isotope and not heavy, therefore likely to be contaminants
+  if (trim_name == "Hela") {
+    
+    #count number of peptides for each uniprotID in each replicate
+      #extract uniprotIDs
+      uniprot <- df %>%
+      pull(uniprotID) %>%
+      str_split(., "; ") %>%
+      do.call(c, .) %>% 
+      unique()
+      
+      #find number of peptides present for each uniprotID in each replicate
+      prot_table <- future_map_dfr(uniprot, function(uni){
+        df %>%
+          filter(grepl(uni, uniprotID)) %>% #filter for peptides matching ID
+          summarise(across(contains("minus") | contains("plus"), ~ sum(!is.na(.x)))) %>%
+          mutate(uniprotID = uni) %>%
+          dplyr::select(uniprotID, everything())
+      })
+    
+    #find uniprotIDs only present in light or heavy SILAC label
+    prot_table <- prot_table %>%
+      rowwise() %>%
+      mutate(lightOnly = sum(c_across(contains("heavy"))) == 0 &
+               sum(c_across(contains("light")), na.rm = T) > 0 ,
+             heavyOnly = sum(c_across(contains("heavy"))) > 0 &
+               sum(c_across(contains("light")), na.rm = T) == 0) %>%
+      ungroup()
+    
+    only_IDs <- prot_table %>%
+      filter(lightOnly | heavyOnly) %>%
+      pull(uniprotID) %>%
+      unique()
+    
+    #mark peptides matching light_IDs as contaminants
+    contam <- map_lgl(df$uniprotID, function(uniprots){
+      uniprot <- str_split(uniprots, "; ")[[1]]
+      matches <- map_lgl(uniprot, ~ any(grepl(.x , only_IDs)))
+      return(any(matches))
+    })
+    contam[is.na(contam)] <- F #for peptides missing uniprotID do not label as contaminant
+    # add silac contaminant information
+    df$contaminant <- df$contaminant | contam
+  }
+  
+  #move data columns right
+  out <- df %>%
+    dplyr::select(-(contains("minus") | contains("plus")), contains("minus") | contains("plus"))
+  return(df)
+})
+
+toc()
+saveRDS(cleanpeps, file.path(wd,"rds", "BR09_01.rawpep.contam.list.RDS"))
+      
+rm(cleanpeps, con_list)
+```
+
+
+
+# Analyse data
+
+analyse DIA RBR-ID datasets by merging charge states and then dividing by median intensity
+
+analyse Hela SILAC data using no pseudocounts
+
+```{r normalize}
+# peplist <- readRDS(file.path(wd,"rds", "BR09_01.rawpep.contam.list.RDS"))
+peplist <- readRDS(file.path(wd,"rds", "BR09_11.rawpep.contam.list.RDS"))
+
+tic("Analyzing RBR-ID data")
+normlist <- future_imap(peplist, function(df, dataset) {
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  FDR_flag = TRUE 
+  Norm_method = "median"
+  paired = FALSE
+  
+  # analyse mESC data using original 2016 methods
+  if (dataset == "mESC") {
+   Norm_method = "mol.cell.2016"
+   paired = TRUE
+   FDR_flag = FALSE 
+  } 
+  
+  #analyze Hela silac data
+  if(trim_name == "Hela") {
+  Norm_method = "silac"
+  }
+
+  # sum charge states if necessary
+    # keep only single annotation per peptide
+    anno_temp <- df %>%
+    dplyr::select(-(contains("minus") | contains("plus"))) %>%
+    group_by(sequence) %>%
+    slice_head(n = 1)
+    
+    #sum abundances from all charge states before analyzing peptide depletions
+    df <- df %>%
+      group_by(sequence) %>%
+      summarise(across((contains("minus") | contains("plus")), ~ sum(.x, na.rm=T))) %>%
+      full_join(anno_temp, ., by = "sequence") %>%
+      ungroup()
+  
+  #calculate depletions
+  out <- NormRBR(df,
+               Normalization = Norm_method,
+               convert.zero.means = T,
+               p.adjust = FDR_flag,
+               paired = paired)
+return(out)
+})
+toc()
+
+saveRDS(normlist, file.path(wd, "rds", "BR09_11.normpep.list.RDS"),)
+
+
+# try using minimum protein values to replace missing values in asymmetric silac peptides 
+
+# try testing pseudo count addition to silac data
+# raw.list <- readRDS(file.path(wd, "rds", "BR09_02_anno.raw_peps.rds"))[c("Hela_nuc", "Hela_nuc")]
+# names(raw.list) <- c("Hela_nuc", "Hela_nuc_pseudo")
+# 
+# hela_pseudo <- future_imap(raw.list, function(df, dataset) {
+#   trim_name <- gsub(x = dataset, pattern = "_.*", "")
+#   
+#   FDR_flag = TRUE 
+#   paired = FALSE
+# 
+#   # sum charge states if necessary
+#     # keep only single annotation per peptide
+#     anno_temp <- df %>%
+#     dplyr::select(-(contains("minus") | contains("plus"))) %>%
+#     group_by(sequence) %>%
+#     slice_head(n = 1)
+#     
+#     #sum abundances from all charge states before analyzing peptide depletions
+#     df <- df %>%
+#       group_by(sequence) %>%
+#       summarise(across((contains("minus") | contains("plus")), ~ sum(.x, na.rm=T))) %>%
+#       full_join(anno_temp, ., by = "sequence") %>%
+#       ungroup()
+#     
+#     norm = "silac"
+#   
+#   if (dataset == "Hela_nuc_pseudo") {
+#     norm = "silac_pseudo"
+#   }
+#   
+#     
+#   #calculate depletions
+#   out <- NormRBR(df,
+#                Normalization = norm,
+#                convert.zero.means = T,
+#                p.adjust = FDR_flag,
+#                paired = paired)
+# return(out)
+# })
+# 
+# saveRDS(hela_pseudo, file.path(wd, "rds", "BR09_01.hela.nuc.anno.normpep.list.RDS"))
+
+```
+
+# Plot number of peptides
+
+```{r peptide_number}
+peplist <- readRDS(file.path(wd, "rds", "BR09_01.normpep.list.RDS"))
+
+# pacman::p_load(pheatmap)
+# pheatmap(out, color=cols, cluster_rows=T,cluster_cols=T,
+#          show_rownames = T, show_colnames = T, main="K562 Exp2 DIA", treeheight_row = 0, treeheight_col = 0)
+
+counts <- map_dfr(peplist, ~ sum(!.x[["empty"]])) %>%
+  reshape2::melt()
+
+ggplot(counts, aes(x = variable,y = value)) +
+  geom_col(fill = "black") +
+  ggtitle("RBR-ID datasets") +
+  ylab("Peptides detected") +
+  xlab("cell type") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45,hjust =0.95, vjust = 0.95)) + 
+  theme(text = element_text(size = 25)) +
+  scale_y_continuous(labels = scales::label_number(scale = .001, suffix = "K", accuracy = 1), 
+    breaks = scales::breaks_width(width = 25000))
+```
+
+# check Silac normalization
+```{r Fig01.2}
+peplist <- readRDS(file.path(wd, "rds", "BR09_01.normpep.list.RDS"))[c("Hela_cyto", "Hela_nuc")]
+
+plot_table <- imap_dfr(peplist, function(df, dataset){
+  df %>% 
+    dplyr::select(sequence, log2fold) %>%
+    mutate(dataset = paste0(dataset, " (",sum(!df$empty)," peptides)"))
+})
+
+v <- ggplot(plot_table, aes(x=log2fold, col = dataset)) +
+  geom_density(size = 1) +
+  theme_bw() +
+  ggtitle( "HeLa peptide SILAC ratios") +
+  scale_color_manual(values = cbp1)+
+  ylab("Frequency") +
+  xlab("mean Log2fold heavy/light (plus-4su / minus) ratio")
+
+v
+```
+
+# Alternative Normalization
+
+```{r checking normalization}
+peplist$K562_exp1_DIA %>% select((contains("minus.") | contains("plus.")) & !contains("Norm")) %>% summarise(across(everything(), sum, na.rm=T)) %>% reshape2::melt() %>% ggplot(.) + geom_col(aes(x = variable, y = value)) + theme(axis.text.x = element_text(angle = 45)) + ggtitle("K562 exp1 total peptide intensities")
+
+#find peptides present in all samples
+df <- peplist$K562_exp1_DIA %>% 
+  select((contains("minus.") | contains("plus.")) & !contains("Norm")) %>%
+  rowwise() %>%
+  mutate(all_present = sum(is.na(c_across(everything()))) == 0) %>%
+  ungroup()
+
+summary <- df %>% 
+  dplyr::select(-all_present) %>%
+  imap_dfr(., function(col, name) {
+    c(sample = name,
+      mean = mean(col, na.rm = T),
+      total = sum(col, na.rm = T),
+      median = median(col, na.rm =T),
+      med_total_ratio = median(col, na.rm =T)/ sum(col, na.rm =T),
+      mean_total_ratio = mean(col, na.rm =T)/ sum(col, na.rm =T))
+  }) %>%
+  reshape2::melt(. , id.vars = "sample") %>%
+  mutate(value = as.numeric(value),
+         condition = gsub(pattern = "K562.+(minus|plus).*", "\\1", sample))
+         
+summary %>% group_by(condition, variable) %>%
+  summarise(mean = mean(value))
+
+ggplot(summary %>%
+         filter(variable == "med_total_ratio")) +
+  geom_col(aes(x = condition, y = value, fill = sample), 
+           position = "dodge") +
+  # scale_y_log10(breaks = scales::trans_breaks("log10", function(x) 10^x)) +
+  theme(axis.text.x = element_text(angle = 45)) + 
+  ggtitle("K562 exp1 peptide summary statistics")
+```
+

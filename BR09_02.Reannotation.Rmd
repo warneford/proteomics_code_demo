@@ -1,0 +1,1841 @@
+---
+title: "BR09_11.Reannotation of peptides"
+author: "Robert Warneford-Thomsom"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+editor_options: 
+  chunk_output_type: console
+knit: (function(inputFile, encoding) { 
+      out_dir <- file.path(dirname(dirname(inputFile)), "Reports");
+      if (!dir.exists(out_dir)) dir.create(out_dir);
+      rmarkdown::render(inputFile,
+                        encoding=encoding, 
+                        output_file=file.path(out_dir,
+                        paste0(tools::file_path_sans_ext(basename(inputFile)), ".html")))
+                        })
+   #directs html output to 'Reports' folder in parent directory of markdown file
+---
+
+Knitted on: `r Sys.time()`
+
+# Setup
+
+## Global options + wd
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+homedir <- "/home/rwt"
+Experiment = "BR09.2021.Young.TF.RBRID"
+wd <- paste0(homedir,"/analyses/2021/", Experiment)
+anno.dir <- file.path(wd, "Annotation_Files")
+cores = 100
+evalFlag = T # option to evaluate all chunks
+```
+
+# Libraries
+
+```{r load libs}
+pacman::p_load(furrr,
+               purrr,
+               tidyverse,
+               tictoc,
+               xlsxjars,
+               janitor,
+               xlsx,
+               Biostrings,
+               scales,
+               GenomicRanges,
+               VennDiagram,
+               gridExtra,
+               pheatmap,
+               ggpubr,
+               ggExtra,
+               RColorBrewer)
+
+```
+
+## Functions
+
+### RBR-ID functions (RWT)
+
+```{r functions}
+source("/home/rwt/scripts/R/RBRID_functions.R",
+       local = knitr::knit_global(),
+       print.eval = T,
+       max.deparse.length = 10000)
+
+#color blind palette
+cbp1 <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+```
+
+### setupCluster
+```{r setupCluster}
+setupCluster <- function(filenumber, total_cores)
+  #function to set up threads using R packages Future
+  #sets up nested parallel environment where total threads are divided between number of desired threads
+  # can provide either integer number of files or simply list to be processed
+{
+  main_threads = ifelse(length(filenumber)>1,length(filenumber),filenumber)
+  sub_threads <- floor(total_cores / main_threads)
+
+  #specify nested parallel threads to allow nested parallel computations
+  #total threads equals length(run_index) * subthreads)
+  future::plan(list(future::tweak(multisession, workers = main_threads),
+            future::tweak(multisession, workers = sub_threads)))
+}
+```
+### my_rename
+
+```{r my_rename}
+#function that allows renaming list elements similarly to dplyr::rename syntax
+my_rename <- function(.x, ..., .strict = TRUE) {
+  pos <- tidyselect::eval_rename(quote(c(...)), .x, strict = .strict)
+  names(.x)[pos] <- names(pos)
+  .x
+}
+```
+### findProt
+
+```{r findProt}
+findProt <- function(x, fasta)
+# This function looks for matches of a peptide passed as x in a biostring FASTA object.
+# Returns the name(s) of the match(es). If more than one returns all separated by a vertical bar
+{
+  hits <- which(vcountPattern(x, fasta)>0) # find matches
+  
+  if(sum(hits)==0) return("") # this early exit prevents error and returns empty string
+  if(length(hits)==1) return(names(fasta)[hits]) # returns hit
+  if(length(hits)>1) {
+    # if there are multiple isoforms of same protein found, return canonical only if present
+      candidates <- names(fasta)[hits]
+        trim <- gsub("-\\d+$", "", candidates) %>%
+        table(.)
+        
+        multi_hits <- names(which(trim > 1)) #identify uniprot ids with multiple hits
+        if (length(multi_hits) > 0) {
+        simplified <- map(multi_hits, function(accession) {
+      #replace isoforms with canonical (if present), then remove duplicates
+          if (any(!grepl("-", candidates[grep(accession, candidates)]))) { # test if canonical isoform is present
+          str <- candidates[grep(accession, candidates)] %>%
+            gsub("-\\d+", "", .)
+          } else {
+            str <- candidates[grep(accession, candidates)]
+          }
+            return(str)}) %>%
+            do.call("c", .) %>%
+            unique(.)
+          
+        #extract unique matches that are non-redundant 
+        uniq_idx <- names(which(trim == 1)) %>% paste0(.,collapse = "|")
+        uniq_ids <- ""
+        if (length(uniq_idx) > 0) {
+        uniq_ids <- grep(uniq_idx, candidates, value =T)
+        }
+
+          out <- paste0(c(uniq_ids, simplified), collapse="|") # returns multiple hits separated by a vertical bar
+        } else {
+          out <- paste0(unique(candidates), collapse="|") # returns multiple hits separated by a vertical 
+        }
+
+    return(out)
+  }
+}
+```
+
+### find_anno
+
+```{r symb}
+find_anno <- function(x, anno)
+{
+  if(is.na(x)) {return(c(symbol = NA_character_, synonyms = NA_character_ ))}
+  
+  #for isoforms, remove isoform information
+  trim <- gsub("-.+", "", x)
+  
+  ids <- unlist(strsplit(trim, "|", fixed = T))
+  symbols <- paste0(unique(anno$symbol[anno$uniprotID %in% ids]), collapse = " ")
+  synonyms <- paste0(anno$synonyms[anno$uniprotID %in% ids], collapse = " ")
+  names <- anno$protein_name[anno$uniprotID %in% ids][[1]]
+  
+  return(c(uniprotID = x,
+           symbol = symbols,
+           synonyms = synonyms,
+           protein_name = names))
+}
+```
+
+### findPosition
+
+```{r findPosition}
+findPosition <- function(peptide_sequence, anno)
+  # function takes a named vector of peptide strings (named with uniprotID) and finds positions within a single AAString reference
+{
+  uniprot <- unique(names(peptide_sequence))
+  
+  pos.table <-map_dfr(peptide_sequence, function(seq) {
+    #if no alignment found, return null
+    if (uniprot == "NA") {
+    return(c(start = NA_integer_, end = NA_integer_))
+    }
+    
+    match <- matchPattern(pattern = seq, subject = anno)[1] #keep first match only
+    position <- list(sequence = seq,
+                     start = start(match),
+                     end = end(match))
+    return(position)
+  })
+  
+  return(pos.table)
+  
+}
+```
+
+# Load Annotations
+
+## Human
+
+```{r load anno, eval = T}
+# load FASTA sequences and annotation for all human mouse Swissprot and Trembl proteins
+annodb <- list()
+
+#Human
+annodb$human$sp.aa <- readAAStringSet(file.path(anno.dir,"uniprot_2022_02_UP000005640_sp_plus_isoforms.fasta"))
+IDs <- sapply(names(annodb$human$sp.aa), function(x){unlist(strsplit(x, "|", fixed = T))[2]})
+  names(annodb$human$sp.aa) <- IDs # simplifies FASTA names to just symbols
+
+#download old isoforms that have changed sequence in 2022_01 or deleted
+conflict_accessions <- c("O14929", "P30837", "P27635", "O15061", "A6NLF2")
+old.aa <- readAAStringSet(file.path(anno.dir,"220218.swissprot.hsapiens.fasta"))
+IDs <- sapply(names(old.aa), function(x){unlist(strsplit(x, "|", fixed = T))[2]})
+  names(old.aa) <- IDs # simplifies FASTA names to just symbols
+old.aa <- old.aa[conflict_accessions]
+names(old.aa) <- paste0(names(old.aa), "-old")
+
+#add deprecated sequences to swissprot
+annodb$human$sp.aa <- c(annodb$human$sp.aa, old.aa)
+
+# load FASTA sequences and annotation for all mouse Tremble
+annodb$human$tr.aa <- readAAStringSet(file.path(anno.dir,"uniprot_2022_02_UP000005640_tr.fasta"))
+IDs <- sapply(names(annodb$human$tr.aa), function(x){unlist(strsplit(x, "|", fixed = T))[2]})
+names(annodb$human$tr.aa) <- IDs # simplifies FASTA names to just symbols
+
+annodb$human$sp <- bind_rows(read.delim(file.path(anno.dir,"uniprot_2022_02_UP000005640_sp_plus_isoforms.tsv")),
+                        read.delim(file.path(anno.dir,"220218.swissprot.hsapiens.tsv")) %>%
+                           filter(Entry %in% conflict_accessions))
+
+annodb$human$tr <- read_delim(file.path(anno.dir,"uniprot_2022_02_UP000005640_tr.tsv"),
+                              name_repair = "universal")
+
+rm(IDs)
+```
+
+## Mouse
+
+```{r mouse_anno, eval = T}
+# load FASTA sequences and annotation for all mouse Swissprot
+annodb$mouse$sp.aa <- readAAStringSet(file.path(anno.dir,"220123.swissprot.mmus.fasta"))
+IDs <- sapply(names(annodb$mouse$sp.aa), function(x){unlist(strsplit(x, "|", fixed = T))[2]})  
+names(annodb$mouse$sp.aa) <- IDs # simplifies FASTA names to just symbols
+
+# load FASTA sequences and annotation for all mouse Trembl
+annodb$mouse$tr.aa <- readAAStringSet(file.path(anno.dir,"220123.tremble.mmus.fasta"))
+IDs <- sapply(names(annodb$mouse$tr.aa), function(x){unlist(strsplit(x, "|", fixed = T))[2]})  
+names(annodb$mouse$tr.aa) <- IDs # simplifies FASTA names to just symbols
+
+# A few columns renaming in the annotation
+annodb$mouse$sp<-read.delim(file.path(anno.dir,"220123.swissprot.mmus.tsv"))
+annodb$mouse$tr<-read.delim(file.path(anno.dir,"220123.tremble.mmus.tsv"))
+
+# Note there are 8 uniprotIDs in our data that have been retired since 2016, we will add them back manually
+old.aa <- readAAStringSet(file.path(anno.dir,"220304.olduniprot.fasta"))
+IDs <- sapply(names(old.aa), function(x){unlist(strsplit(x, "|", fixed = T))[2]})  
+names(old.aa) <- IDs # simplifies FASTA names to just symbols
+
+old_uniprot_tbl <- read.delim(file.path(anno.dir,"220304.olduniprot.tsv"))
+
+# add deprecated accessions to trembl data
+annodb$mouse$tr.aa <- c(annodb$mouse$tr.aa, old.aa)
+annodb$mouse$tr <- rbind(annodb$mouse$tr, old_uniprot_tbl)
+
+#Extract protein symbol and rename inside annotation
+clean_df <- function(df) {
+  df <- df %>%
+    dplyr::rename(uniprotID = Entry,
+                  symbol = Gene.names...primary..,
+                  protein_name = Protein.names,
+                  synonyms = Gene.names...synonym..) %>%
+    as_tibble()
+  return(df)
+}
+
+annodb$human$sp <- clean_df(annodb$human$sp)
+annodb$human$tr <- clean_df(annodb$human$tr)
+annodb$mouse$sp <- clean_df(annodb$mouse$sp)
+annodb$mouse$tr <- clean_df(annodb$mouse$tr)
+
+saveRDS(annodb, file.path(anno.dir, "220627_annodb.hsapiens.mmus.RDS"))
+
+rm(clean_df, old.aa, old_uniprot_tbl, IDs)
+```
+
+## TF annotations
+
+```{r TF_anno, eval = T}
+annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.RDS"))
+
+#load mouse TFs
+annodb$mouse$TF <- read.delim(file.path(anno.dir,"UniProt2Ensembl.human2mouse.txt")) %>%
+  select(1:6) %>%
+  dplyr::rename(symbol = Gene_Mouse)
+
+#load human TFs
+annodb$human$TF <- read.table(file.path(anno.dir, "human_TF_list.txt"),header = F, sep = "|") %>%
+  dplyr::select(2) %>%
+  dplyr::rename(uniprotID = V2) %>%
+  # add gene symbols to TF list 
+  group_by(uniprotID) %>%
+  mutate(symbol = annodb$human$sp[["symbol"]][annodb$human$sp$uniprotID == uniprotID])
+
+#load lambert TFs  (deprecated)
+#Lambert_TFs <- read.table(file.path(anno.dir, "Lambert_2018_Human_TF_list.txt"),header = F)
+
+saveRDS(annodb, file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+```
+
+# Reannotation of peptides
+
+Will strip data from peptide tables and adjust only annotation metadata, that way I can easily update the analysis without having to re-do the time-consuming annotation script
+ 
+## Find protein matches for mouse and human peptides
+
+```{r annotate_uniprot, eval = T}
+#load peptide list
+peplist <- readRDS(file.path(wd, "rds", "BR09_11.normpep.list.RDS"))
+
+names(peplist) <- paste0("K562_", names(peplist))
+
+#load annotation 
+annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+
+#strip experimental intensities, keep only peptide sequences
+peplist <- lapply(peplist, function(df){
+  df <- df %>%
+    dplyr::select(sequence)
+})
+
+#collapse datasets into species-specific tables
+species <- c(human = "human",
+             mouse = "mouse")
+
+#generate merged list of peptides for all samples from each species present
+species_list <- map(species, function(type){
+  index <- names(peplist)[map_chr(names(peplist), Whatspecies) == type]
+  peplist[index] %>%
+    do.call("bind_rows", .) %>%
+    distinct()
+})
+
+#load existing peptide mappings for each species
+if(file.exists(file.path(wd, "rds/BR09_02_master_peptide_annotation.rds"))) {
+annotation <- readRDS(file.path(wd, "rds/BR09_02_master_peptide_annotation.rds"))
+} else {
+  annotation <- map(species, ~ tibble(sequence = character(),
+                                    sp.hits = character(),
+                                    tr.hits = character()))
+}
+
+#specify nested parallel threads to allow nested parallel computations
+#total threads equals length(run_index) * subthreads)
+setupCluster(1, total_cores = cores)
+
+  tic("Annotating new peptide protein matches")
+  #For each species:
+  #Find protein matches for peptides not already present in existing annotation
+  new_reference <- future_map(species, function(type) {
+    #extract tables
+    new_peptides <- species_list[[type]]
+    annotated_peptides <- annotation[[type]]
+    sp.aa <- annodb[[type]]$sp.aa
+    tr.aa <- annodb[[type]]$tr.aa
+    
+    if (nrow(new_peptides) == 0) {
+      warning(paste("no ", type, "peptides found in dataset"))
+      return(annotated_peptides)
+    }
+    
+    #identify new peptides not present in existing annotation
+    novel_peps <- anti_join(new_peptides, annotated_peptides, by = "sequence")
+    
+    #if no novel peptides present, return existing annotation
+    if (nrow(novel_peps) == 0) {
+      warning(paste("no novel", type, "peptides found in dataset"))
+      return(annotated_peptides)
+    }
+  
+  # Find protein matches for novel peptides
+      #swissprot
+      sp.hits <- future_map_chr(novel_peps$sequence, function(x){findProt(x, sp.aa)})
+      #trembl
+      tr.hits <- future_map_chr(novel_peps$sequence, function(x){findProt(x, tr.aa)})
+
+      novel_peps$sp.hits <- sp.hits
+      novel_peps$tr.hits <- tr.hits
+  #add novel mapped peptides to existing annotation
+  updated_peps <- bind_rows(novel_peps, annotated_peptides)
+
+return(updated_peps)
+})
+toc()
+
+#save updated set of peptide annotations
+saveRDS(new_reference, file.path(wd, "rds/BR09_02_master_peptide_annotation.rds"))
+```
+
+## Simplify to single uniprotID per peptide
+
+```{r reduce_uniprot, eval = T}
+pephits <- readRDS(file.path(wd, "rds/BR09_02_master_peptide_annotation.rds"))
+#load peptide intensities
+intpeps <- readRDS(file.path(wd, "rds", "BR09_11.normpep.list.RDS"))
+
+names(intpeps) <- paste0("K562_", names(intpeps))
+
+#update futures
+  # set up subthreads for nested parallelization, where applicable
+setupCluster(length(intpeps), total_cores = cores)
+
+tic("Reducing uniprot assignment to single ID")
+
+annopeps <- future_imap(intpeps, function(rbrid, dataset){
+
+      species <- Whatspecies(dataset)
+      #match peptide annotation
+      annotation <- pephits[[species]]
+  
+  rbrid <- rbrid %>%
+    dplyr::select(sequence, empty, contaminant) #extract missing data information
+  
+  #add information on which peptides are missing in data (to inform assignment of uniprotID below)
+  merged <- left_join(rbrid, annotation, by = "sequence")
+  
+  return(merged)
+})
+
+
+newpeplist <- future_map(annopeps, function(rbrid) {
+
+  # Simplify down by considering only Swissprot (reviewed) when present and falling back on Tremble (unreviewed) if no Swissprot exists
+  rbrid$uni.hits <- rbrid$sp.hits
+  pos <- which(rbrid$uni.hits == "") # which ones do not have a Swissprot hit?
+  rbrid$uni.hits[pos] <- rbrid$tr.hits[pos] # fill with Tremble
+  
+  #discard peptides that do not map to any annotation
+  idx <- rbrid$uni.hits == ""
+  unmapped <- rbrid[idx,]
+  
+  rbrid <- rbrid[!idx,]
+  
+  # resolve cases where there is more than one UniprotID peptide match. Take an approach similar to RAZR peptides where we default to most frequent ID
+  
+    # rank all uniprotIDs in table in decreasing frequency (ignoring empty  or contaminant peptides)
+    idx <- which(!rbrid$empty & !rbrid$contaminant)
+    ID <- future_map(rbrid$uni.hits[idx], function(ids) {
+      as.vector(unlist(strsplit(ids, "|", fixed = T)))
+      }) %>% purrr::reduce(. , `c`)
+    
+    ranked <- table(ID) %>%
+      as_tibble() %>%
+      arrange(-n) %>%
+      pull(ID)
+    
+    rbrid$uniprotID <- NA_character_
+    
+    #assign dominant ID for peptides detected in dataset
+    rbrid$uniprotID[idx] <-  future_map_chr(rbrid$uni.hits[idx], function(hits) {
+      if(str_count(hits, "\\|") == 0)# if only one ID return that one
+      { output = hits 
+        } else {
+        #find option that is most frequent
+        opt <- as.vector(unlist(strsplit(hits, "|", fixed = T)))
+        choice <- opt[which.min(map_dbl(opt, ~ grep(pattern = paste0(.,"$"), x = ranked)))]
+        output = choice
+        }
+    return(output)
+  })
+  return(list(rbrid, unmapped))
+})
+
+  #extract unmapped peptides
+  unmapped <- map(newpeplist, 2)
+  
+  imap_chr(unmapped, function(table, dataset){
+    paste0(dataset, ": ", nrow(table), " peptides did not map to any accession and were discarded")
+  })
+  saveRDS(unmapped, file.path(wd, "rds/BR09_11_unmapped.peptides.Rds"))
+
+saveRDS(map(newpeplist, 1), file.path(wd, "rds/BR09_11_with_main_hits.Rds"))
+toc()
+
+rm(unmapped, newpeplist, intpeps, pephits, annopeps)
+```
+
+## Add symbols
+
+```{r symbols, eval = T}
+tic()
+#load annotation
+annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+
+old_peplist <- readRDS(file.path(wd, "rds/BR09_11_with_main_hits.Rds"))
+
+rbrid <- old_peplist$K562_exp1_DIA
+dataset <- "K562_exp1_DIA"
+  
+newpeplist <- future_imap(old_peplist, function(rbrid, dataset) {
+  
+  # extract species information from dataset name
+  species <- Whatspecies(dataset)
+  
+  sp <- annodb[[species]]$sp
+  tr <- annodb[[species]]$tr
+
+  uni <- bind_rows(sp, tr) %>%
+    dplyr::select(uniprotID, symbol, synonyms, protein_name) %>% 
+    distinct()
+
+  anno <- future_map_dfr(unique(rbrid$uniprotID), function(x){
+    find_anno(x, uni)
+  })
+  rbrid <- left_join(rbrid, anno, by = "uniprotID")
+
+  rbrid <- rbrid %>%
+    mutate(uni.main.all = case_when(synonyms == "" ~ paste0(symbol, " "),
+                                    is.na(symbol) ~ NA_character_, 
+                                    TRUE ~ paste0(symbol, " ", synonyms, " ")))
+  return(rbrid)
+})
+
+saveRDS(newpeplist, file.path(wd, "rds/BR09_11_anno.Rds"))
+toc()
+```
+
+## Add peptide numbering
+
+```{r numbering, eval = T}
+tic()
+peplist <- readRDS(file.path(wd, "rds/BR09_11_anno.Rds"))
+annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+
+rbrid <- peplist$K562_exp1_DIA
+dataset <- "K562_exp1_DIA"
+
+  subthreads <- floor(cores / length(peplist))
+  #specify nested parallel threads to allow nested parallel computations
+  #total threads equals length(run_index) * subthreads)
+  plan(list(tweak(multisession, workers = length(peplist)),
+            tweak(multisession, workers = subthreads))
+       )
+
+newpeplist <- future_imap(peplist, function(rbrid, dataset) {
+  
+    # extract species information from dataset name
+    species <- Whatspecies(dataset)
+  
+  sp.tr.fasta <- c(annodb[[species]]$sp.aa, annodb[[species]]$tr.aa)
+  
+  #nest sequences and uniprotIDs for computation
+  sequences <- rbrid$sequence
+  names(sequences) <- rbrid$uniprotID
+  
+  #group by uniprotID
+  uniprots <- unique(rbrid$uniprotID) %>% purrr::discard(is.na)
+  grouped.sequence <- base::split(sequences, f = names(sequences))
+  
+  #pair fasta and peptide order
+  trim.fasta <- sp.tr.fasta[uniprots]
+  grouped.sequence <- grouped.sequence[uniprots]
+  
+  #convert AAStringSet to list of separate AAStrings
+  protein_seqs <- as.character(trim.fasta) %>%
+    map(. , AAString)
+  
+  pos <- future_map2_dfr(grouped.sequence, protein_seqs,
+                                function(seq, anno) {findPosition(seq, anno)})
+  rbrid <- left_join(rbrid, pos, by = "sequence")
+    
+  return(rbrid)
+})
+
+saveRDS(newpeplist, file.path(wd, "rds",  "BR09_11_anno.position.rds"))
+toc()
+```
+
+## Calculate protein coverage
+```{r coverage, eval = T}
+tic()
+ peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.position.rds"))
+ annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+ 
+ rbrid <- peplist$K562_exp1_DIA
+ dataset <- "K562_exp1_DIA"
+ 
+ setupCluster(length(peplist), cores)
+ 
+ newpeplist <- future_imap(peplist, function(rbrid, dataset) {
+     species <- Whatspecies(dataset)
+     
+     uniprotIDs <- unique(rbrid$uniprotID) %>% purrr::discard(., is.na)
+     names(uniprotIDs) <- uniprotIDs
+     
+     anno.fasta <- c(annodb[[species]]$sp.aa, annodb[[species]]$tr.aa)
+     
+     #prepare peptides
+     pep.list <- rbrid %>%
+       filter(!is.na(uniprotID)) %>%
+       dplyr::select(uniprotID, start, end) %>%
+       base::split(., f = .$uniprotID)
+     
+     #pair order between fasta and granges
+     pep.list <- pep.list[uniprotIDs]
+     #calculate protein lengths
+     lengths <- map_dbl(uniprotIDs, ~ length(anno.fasta[[.]]))
+     
+     #calculate coverage
+       coverages <- future_map2_dbl(pep.list, lengths, function(peps, length) {
+         #convert to granges
+         gr <-GRanges(seqnames=peps$uniprotID,
+                      ranges=IRanges(start=peps$start,
+                                     end=peps$end))
+         range = GRanges(seqnames=unique(peps$uniprotID),
+                         ranges=IRanges(start=1,
+                         end=length))
+         #calculate coverage
+         coverage_raw <- calculateCoverage.apply(range, gr)
+         coverage <- round(coverage_raw * 100, digits = 2)
+         return(coverage)
+       })
+     
+     rbrid$prot_coverage_pct <- map_dbl(rbrid$uniprotID, function(uni){
+       if(is.na(uni)) {return(NA_real_)}
+       coverages[[uni]]})
+     
+   return(rbrid)
+ })
+ 
+ saveRDS(newpeplist, file.path(wd, "rds", "BR09_11_anno.position.cov.rds"))
+ toc()
+```
+
+## Add Interpro hits
+
+Annotate peptides for associated Interpro domains at both peptide and protein level
+
+```{r update Interpro, eval = T}
+tic()
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.position.cov.rds"))
+ipr.db <- readRDS("/home/rwt/genomes/Interpro/220228.protein2ipr.mouse.human.rds")
+
+#specify nested parallel threads to allow nested parallel computations
+#total threads equals length(run_index) * subthreads)
+plan(list(tweak(multisession, workers = length(peplist)),
+          tweak(multisession, workers = floor(cores/length(peplist)))))
+
+newpeplist <- future_imap(peplist, function(rbrid, dataset){
+  
+  # extract species information from dataset name
+  species <- Whatspecies(dataset)
+
+  #trim datasets to save memory for parallel export
+  positions <- rbrid %>% 
+    dplyr::filter(!is.na(uniprotID)) %>%
+    ungroup() %>%
+    dplyr::select(uniprotID,sequence, start, end)
+  
+
+  uniprots <- unique(rbrid$uniprotID) %>% purrr::discard(. , is.na)
+  ipr.anno <- ipr.db[[species]] %>%
+    dplyr::select(uniprotID, iprID, IPR_start, IPR_end) %>%
+    dplyr::filter(uniprotID %in% uniprots)
+
+  #split data into paired lists for memory speed up
+  ipr.uniprot <- base::split(ipr.anno, f = ipr.anno$uniprotID)
+  position.list <- base::split(positions, f = positions$uniprotID)
+
+  #match order 
+  ipr.uniprot <- ipr.uniprot[uniprots]
+  position.list <- position.list[uniprots]
+
+  IPR.annotations <- future_map2_dfr(position.list, ipr.uniprot, function(positions, ipr.anno) {
+    
+    if(is.null(ipr.anno)) {return(NULL)}
+    
+  if(unique(positions$uniprotID) != unique(ipr.anno$uniprotID)) {
+    stop("uniprotIDs do not match between peptides and ipr annotation list element, check order ")
+  }
+  protein_IPR <- paste(unique(ipr.anno$iprID), collapse="|") # annotates with all IPR hits for the protein (regardless of position)
+  rows <- base::split(positions, f = 1:nrow(positions))
+  
+  peptide_IPR <- map_chr(rows, function(row) {
+    # the following decides whether the actual peptide overlaps the start, end, or is contained within the various IPRs
+    overlap_start<-row$start<=ipr.anno$IPR_start & row$end>=ipr.anno$IPR_start
+    overlap_end<-row$start<=ipr.anno$IPR_end & row$end>=ipr.anno$IPR_end
+    inside<-row$start>=ipr.anno$IPR_start & row$end<=ipr.anno$IPR_end
+    
+    out <-paste(unique(ipr.anno$iprID[overlap_start | overlap_end | inside]),collapse="|") # annotates IPRs that overlap
+    return(out)
+    })
+  out <- tibble(sequence = positions$sequence,
+                interpro_peptide = peptide_IPR,
+                interpro_protein = protein_IPR)
+  return(out)
+  })
+  
+  annotated <- full_join(rbrid, IPR.annotations, by = "sequence")
+  
+  # for swissprot alternative isoforms with no annotated interpro domains, include interpro annotations for canonical isoform
+  annotated <- annotated 
+  
+  return(annotated)
+})
+
+
+saveRDS(newpeplist, file.path(wd, "rds", "BR09_11_anno.IPR.rds"))
+rm(newpeplist, peplist, ipr.db)
+toc()
+```
+
+## Match Whitehead TFs + DBD
+
+```{r whitehead, eval = T}
+tic("Matching Whitehead TFs and annotating DBDs")
+annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+
+# load Interpro DBD table
+Interpro_DBD.table <- read.xlsx(
+  file.path(anno.dir, "220309 DBD Interpro table.xlsx"),
+  sheetIndex = 1)
+
+old_peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.rds"))
+
+# rbrid <- old_peplist$Hela_nuc
+# dataset <- "K562"
+
+newpeplist <- future_imap(old_peplist, function(rbrid, dataset) {
+  
+  #remove contaminants and empty peptides
+  rbrid <- rbrid %>%
+    dplyr::filter(!contaminant) %>%
+    dplyr::filter(!empty) %>%
+    dplyr::select(-contaminant, -empty)
+  
+  species <- Whatspecies(dataset)
+  
+  TFs <- annodb[[species]]$TF$symbol %>% unique() %>% .[. != ""] #drop empty string
+  names(TFs) <- TFs
+    
+  indexes <- future_map(TFs, function(TF) {
+    TF.regex <- paste0("\\b", TF, "\\ ") # \\b whole word boundary also matches start of line
+    pos <- grep(TF.regex, rbrid$uni.main.all)
+    return(pos)
+  }) %>%
+    purrr::compact(.) #drop empty list elements
+  
+  temp <- vector(mode = "character", length = nrow(rbrid)) #initialize vector
+  whitehead_TF_raw  <- future_imap(indexes, function(pos, TF){
+    temp[pos] <- paste0(TF, " ")
+    return(temp)
+  }) %>%
+    do.call(paste0, .) %>%
+    gsub("\ *$", "", x = .) #remove trailing whitespace
+
+  #for peptides with multiple TFs associated, default to symbol with highest frequency in table
+
+  # rank all symbols in table in decreasing frequency
+  ID <- future_map(whitehead_TF_raw, function(symbols) {
+    as.vector(unlist(strsplit(symbols, " ", fixed = T)))
+    }) %>% purrr::reduce(. , `c`)
+  
+  ranked <- table(ID) %>%
+    as_tibble() %>%
+    arrange(-n) %>%
+    pull(ID)
+  
+  #reduce to single TF
+  rbrid$whitehead_TF <- future_map_chr(whitehead_TF_raw, function(hits) {
+    if (hits == "") {return("")} # skip empty rows
+  
+    if(str_count(hits, " ") == 0) # if only one ID return that one
+    { return(hits) 
+      } else {
+        paste(hits)
+      #find option that is most frequent
+      opt <- as.vector(unlist(strsplit(hits, " ", fixed = T)))
+      choice <- opt[which.min(map_int(paste0("^",opt, "$"), grep, ranked))]
+      return(choice)
+      }
+    })
+
+  # Count protein occurrences for filtering
+  symbol_counts <- as.data.frame(table(rbrid$symbol))
+  colnames(symbol_counts) <- c("symbol", "peptides_detected")
+  symbol_counts <- as_tibble(symbol_counts)
+  rbrid <- full_join(rbrid, symbol_counts, by = "symbol")
+  
+  #annotate TF peptides that overlap Interpro DBDs
+  #initialize column as 0, but set "none in protein" for proteins lacking any known IPR DBD
+  out <- vector(mode = "character",length =nrow(rbrid))
+  rbrid$interpro_DBD <- future_map(Interpro_DBD.table$IPR_ID,
+                     function(IPR) {
+                       dbd <- Interpro_DBD.table$Name[Interpro_DBD.table$IPR_ID == IPR]
+                       index_match <- grep(IPR, rbrid$interpro_peptide)
+                       out[index_match] <- paste0(out[index_match], dbd, " ")
+                       return(out)
+                                }) %>%
+    purrr::compact(.) %>%
+    do.call("paste0", .) %>%
+    gsub("\ *$", "", x=.) # remove trailing zeros
+  
+    dbds <- Interpro_DBD.table$IPR_ID %>%
+    paste0(. , collapse = "|")
+  #annotate proteins that contain an RBD
+  rbrid <- rbrid %>%
+    group_by(uniprotID) %>%
+    mutate(protein_contains_DBD = grepl(dbds, unique(interpro_protein))) %>%
+    ungroup()
+  
+  annotcols <- c("uniprotID", "symbol","whitehead_TF","protein_name", "peptides_detected", "synonyms", "uni.hits", "uni.main.all", "start", "end", "sequence", "interpro_protein", "interpro_peptide", "interpro_DBD", "protein_contains_DBD", "prot_coverage_pct")
+
+  rbrid <- rbrid %>%
+    dplyr::select(all_of(annotcols))
+
+return(rbrid)
+})
+
+
+saveRDS(newpeplist, file.path(wd, "rds", "BR09_11_anno.IPR.wh.rds"))
+
+rm(annodb, newpeplist)
+toc()
+```
+
+## Annotate Interpro RBDs
+
+I searched Interpro for domains matching GO term `GO:0003723` Molecular Function = "RNA Binding"
+Will use this to define a crude set of RNA binding domains:
+
+annotate individual peptides with known RNA-binding domains from Interpro
+
+```{r interpro_RBD_anno}
+tic()
+annopeps <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.rds"))
+
+#load interpro RBD annotation table
+RBD_interpro <- read_tsv(file = file.path(anno.dir, "220427_Manual_interpro_RBDs.txt"))
+
+# rbrid <- annopeps$K562
+# dataset <- "K562"
+
+#add annotation information for median mouse normalized data
+newpeplist <- future_imap(annopeps, function(rbrid, dataset){
+  
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  species <- Whatspecies(trim_name)
+  
+  #annotate TF peptides with associated uniprot RNA-binding domains
+  rbrid$interpro_RBD <-future_map(RBD_interpro$iprID,
+                                       function(IPR) {
+                       out <- vector(mode = "character", length = nrow(rbrid))
+                       rbd <- RBD_interpro$name[RBD_interpro$iprID == IPR]
+                       index_match <- grepl(IPR, rbrid$interpro_peptide)
+                       out[index_match] <- paste0(rbd, " ") # add spacer between results
+                       return(out)
+                                }) %>%
+    do.call("paste0", .) %>%
+    gsub("\ *$", "", x=.) #remove trailing whitespace
+  
+  rbds <- RBD_interpro$iprID %>%
+    paste0(. , collapse = "|")
+  #annotate proteins that contain an RBD
+  rbrid <- rbrid %>%
+    group_by(uniprotID) %>%
+    mutate(protein_contains_RBD = grepl(rbds, unique(interpro_protein))) %>%
+    ungroup()
+  return(rbrid)
+  })
+
+saveRDS(newpeplist, file.path(wd, "rds", "BR09_11_anno.IPR.wh.rbd.rds"))
+toc()
+```
+
+## Merge annotations with data
+
+```{r merge_anno}
+tic()
+#load annotated peptides
+annopeps <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.rbd.rds"))
+#load normalized peptide intensities
+int.list <- readRDS(file.path(wd, "rds", "BR09_11.normpep.list.RDS"))
+
+names(int.list) <- paste0("K562_", names(int.list))
+
+#add annotation information for median mouse normalized data
+annopeplist <- future_imap(int.list, function(rbrid, dataset){
+  
+  if (!any(names(rbrid) %in% "padj")) {
+    #add adjusted pvalue
+     rbrid$padj <- stats::p.adjust(rbrid$pval, method = "BH")
+  }
+  
+  anno <- annopeps[[dataset]]
+  
+  #keep only summary statistics and peptide sequence for identification
+  int_trim <- rbrid %>%
+    dplyr::select(sequence,
+                  log2fold,
+                  pval,
+                  padj,
+                  score,
+                  minusObs,
+                  plusObs,
+                  test_used = test)
+
+  #join annotation with quantification data
+  out <- left_join(anno, int_trim, by = "sequence") %>%
+    arrange(-score) %>%
+    as_tibble()
+  
+  return(out)
+})
+
+saveRDS(annopeplist, file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))
+
+
+#add annotation information for raw intensity data (to test using protein level abundances to allow for silac pseudocounts)
+raw.list <- readRDS(file.path(wd, "rds", "BR09_11.rawpep.contam.list.RDS"))
+
+rawpeplist <- future_imap(raw.list, function(rbrid, dataset){
+  
+  anno <- annopeps[[dataset]]
+  
+  #remove old annotation information
+  int_trim <- rbrid %>%
+    dplyr::select(sequence,
+                  contaminant,
+                  contains("minus"),
+                  contains("plus")) %>%
+      group_by(sequence) %>% #sum charge states
+      summarise(contaminant = unique(contaminant),
+                across((contains("minus") | contains("plus")), ~ sum(.x, na.rm=T)))
+
+  #join annotation with quantification data
+  out <- left_join(anno, int_trim, by = "sequence") %>%
+    as_tibble()
+  
+  return(out)
+})
+
+saveRDS(rawpeplist, file.path(wd, "rds", "BR09_11_anno.raw_peps.rds"))
+toc()
+```
+
+# QC Figures
+
+## Fig02_1 missing values
+```{r files_fig02.1 prep, eval = F}
+run_index <- c("K562_exp1_DIA",
+               "K562_exp1_DIA_rwtDIA")
+               # "K562_exp2_DIA",
+               # "K562_exp3_DIA_std_sonication",
+               # "K562_exp3_DIA_4xsonication",
+               # "mESC",
+               # "Hela_nuc")
+
+peplist <- readRDS(file.path(wd, "rds", "BR09_05_anno.IPR.wh.full_peptides.rds"))[run_index]
+
+setupCluster(run_index, cores)
+
+missing_vals <- future_imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+  filt <- rbrid[rbrid$peptides_detected > 2,]
+  
+  #convert 0 to NA
+  Samplecols <- grep("(minus|plus).*\\d$",names(filt))
+  filt[,Samplecols] <- lapply(filt[,Samplecols], function(x) if_else(x == 0, NA_real_, x))
+
+  #count missing values in each dataset 
+  filt<-filt %>%
+  mutate(dataset = dataset,
+         missing_vals = rowSums(is.na(filt[,Samplecols])), # find missing values in datacolumns
+         avg_int = rowMeans(filt[,Samplecols], na.rm =T),# calculate mean unnormalized peptide intensities
+         total_obs = length(Samplecols) * nrow(filt)) %>% # calculate total possible peptide observations
+  select(dataset, missing_vals, avg_int, total_obs)
+
+return(filt)
+}) %>%
+  do.call(rbind, .)
+
+
+#Calculate summary statistics
+# average missing peptides per peptide, per replicate
+miss_summary <- missing_vals %>%
+  group_by(dataset) %>%
+  summarise(peptide_mean = mean(missing_vals),
+            pct_missing = round(sum(missing_vals, na.rm = T)/unique(total_obs)*100, digits = 2))
+
+miss_summary
+
+#calculate % missing values in total matrix
+missing_vals
+
+cbp1 <- c("#999999", "#E69F00", "#56B4E9", "#009E73",
+          "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+g <- ggplot(missing_vals, aes(x = missing_vals, fill = dataset)) +
+  geom_histogram(binwidth = 1) +
+  facet_wrap(~dataset, scales = "free_x", nrow = 1) +
+  theme_bw() +
+  scale_x_continuous("Missing in X replicates",
+    breaks = scales::breaks_pretty()) +
+  scale_y_continuous("Number of peptides",
+    labels = scales::label_number(scale = .001, suffix = "K", accuracy = 1),
+    breaks = scales::breaks_width(width = 10000)) +
+  ggtitle("Distribution of Peptide-level missing values in RBR-ID datasets") +
+  theme(text = element_text(size=20)) +
+  scale_fill_manual(values = cbp1) +
+  theme(strip.text.x = element_text(size = 8, colour = "black"))
+
+ggplot(missing_vals %>%
+         filter(dataset %in% c("K562_exp3_DIA_std_sonication",
+                               "K562_exp3_DIA_4xsonication")),
+       aes(x = missing_vals, fill = dataset)) +
+              geom_bar(position = position_dodge(width = 1)) +
+  theme_bw() +
+  scale_x_continuous("Missing in X replicates",
+    breaks = scales::breaks_pretty()) +
+  scale_y_continuous("Number of peptides",
+    labels = scales::label_number(scale = .001, suffix = "K", accuracy = 1),
+    breaks = scales::breaks_width(width = 10000)) +
+  ggtitle("Distribution of Peptide-level missing values in RBR-ID datasets") +
+  theme(text = element_text(size=20)) +
+  scale_fill_manual(values = cbp1) +
+  theme(strip.text.x = element_text(size = 8, colour = "black"))
+
+
+y <- ggplot(missing_vals, aes(x = avg_int, fill = dataset)) +
+              geom_density(alpha = 0.4) +
+  theme_bw() +
+  ylab("Frequency of peptides") +
+  xlab("Average raw peptide intensity") +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(labels = scales::scientific) +
+  ggtitle("Distribution of Peptide intensities in RBR-ID datasets") +
+  theme(text = element_text(size=20)) +
+  scale_fill_manual(values = cbp1)
+
+#plot percent of peptides that were detected only in -4su conditions
+peplist <- my_rename(peplist, K562_exp2_DIA_benzonase = "K562_exp2_DIA")
+fish_pct <- map_dfr(peplist[grep("K562",names(peplist))], ~sum(.x[["test"]] == "fisher_exact" & .x[["minusObs"]] > 0)/nrow(.x)) %>%
+  reshape2::melt()
+
+ggplot(fish_pct) +
+  geom_bar(aes(x= variable, y = value),
+           stat = "identity") +
+        ggtitle("RBR-ID % peptides only detected in -4SU condition") +
+  ylab("% of peptides") +
+  xlab("cell type") +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.95, hjust =0.95)) +
+  scale_y_continuous(labels = scales::label_percent()) +
+  theme(axis.text = element_text(size = 10))
+
+#plot % of missing values
+z <- ggplot(miss_summary, aes(x = dataset, y = pct_missing, fill = dataset)) + 
+  geom_col() +
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=45, vjust = 0.95, hjust =0.95)) +
+  scale_fill_manual(values = cbp1)+
+  ylab("% missing peptides") +
+  ggtitle("Number of missing values")
+  
+
+ggarrange(g, z, y,
+          nrow= 2,
+          ncol=2,
+          widths=c(4,1),
+          common.legend = T,
+          legend = "bottom")
+
+#compare K562 side by side
+ggplot(missing_vals %>% 
+         filter(dataset %in% c("K562_exp1_DIA","K562_exp2_DIA")),
+       aes(x = avg_int, fill = dataset)) +
+              geom_density(alpha = 0.4) +
+  theme_bw() +
+  ylab("Frequency of peptides") +
+  xlab("Average raw peptide intensity") +
+  scale_x_continuous(trans = "log10") +
+  scale_y_continuous(labels = scales::scientific) +
+  ggtitle("Distribution of Peptide intensities in RBR-ID datasets") +
+  theme(text = element_text(size=20)) +
+  scale_fill_manual(values = cbp1)
+```
+
+
+## Fig02_2 protein coverage
+```{r files_fig02.1 prep, eval = F}
+# run_index <- c("K562", "mESC", "HepG2", "Hela_nuc")
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+rbrid <- peplist$K562_exp1_DIA
+dataset <- "K562_exp1_DIA"
+# peplist %>%
+#   map(pull, "prot_coverage_pct") %>%
+#   map_dbl(Gini)
+
+coverage_table <- future_imap(peplist, function(rbrid, dataset) {
+  #filter for proteins with at least 3 peptides
+  rbrid <- rbrid %>%
+    filter(peptides_detected > 2)
+
+  #output coverage and metadata information
+  out <- rbrid %>%
+    dplyr::select(uniprotID,
+                  whitehead_TF,
+                  prot_coverage_pct,
+                  interpro_protein) %>%
+    distinct() %>%
+    mutate(dataset = dataset) #annotate experiment
+  return(out)})
+
+g <- ggplot(coverage_table %>%
+              do.call("rbind", .),
+            aes(x = prot_coverage_pct, fill = dataset)) +
+  geom_density(alpha = 0.5) +
+  facet_wrap(facets = "dataset") +
+  scale_fill_manual(values = cbp1) +
+  theme_bw() +
+  # scale_x_continuous(labels = scales::percent) +
+  xlab("% sequence coverage") +
+  ylab("Frequency") +
+  ggtitle("Protein coverage in RBR-ID ")
+
+dpb <- ggplot_build(g)
+
+cov_df <- coverage_table$K562_exp1_DIA
+dataset <- "K562_exp1_DIA"
+
+TF_highlights <- imap_dfr(coverage_table, function(cov_df, dataset){
+
+  #highlight TF coverage
+  TF_table <- cov_df %>%
+    filter(cov_df$whitehead_TF != "")
+
+  uniprot <- TF_table$uniprotID
+  names(uniprot) <- uniprot
+
+  #extract TF coverage values
+  x1 <- map_dbl(uniprot, function(uni) {
+    coverage <- cov_df$prot_coverage_pct[cov_df$uniprotID == uni]
+    return(coverage)
+    })
+
+  #extract panel used
+  layout <- dpb$layout$layout
+  panel <- layout$PANEL[layout$dataset == dataset]
+
+  df <- dpb$data[[1]] %>%
+    filter(PANEL == panel)
+
+  #extract neighboring protein coverage
+  x2 <- map(x1, function(vertex) {
+    x <- df$x[min(which(df$x > vertex))]
+    return(c(vertex, x))
+  })
+
+  posdf <- imap_dfr(x2, function(xpos, uni){
+
+    yleft = df$y[min(which(df$x > xpos[1]))]
+    yright = df$y[min(which(df$x > xpos[2]))]
+
+    pos <- tibble(
+          xx = c(rep(xpos[1], 2), rep(xpos[2], 2)),
+          yy = c(0, yleft, yright, 0),
+          Domain = uni)
+    return(pos)
+  })
+
+      # Reorder domain factors so legend displays domains N-to-C terminal
+      order <- posdf$Domain[order(posdf$xx)]
+      order <- order[!duplicated(order)]
+      posdf$Domain <- factor(posdf$Domain, levels = order)
+
+      posdf$dataset = dataset
+      posdf$legend = "TF proteins"
+      return(posdf)
+})
+
+
+
+     g <-  g + geom_polygon(TF_highlights, mapping = aes(x = xx,
+                                                    y = yy,
+                                                    group=Domain,
+                                                    fill = legend),
+                       alpha = 0.5) +
+        scale_fill_manual("", values = cbp1) +
+        theme(legend.position = "top")
+
+g
+```
+
+HepG2 experiment has much lower average protein coverage.
+
+I want to figure out if the lack of coverage is due to some proteins dominating the signal
+
+
+##  Fig 02_3: TF & RBR overlap
+
+```{r venn, eval =F}
+# specify samples to analyse
+
+run_index <- c("K562_exp1_DIA",
+               "K562_exp1_DIA_rwtDIA",
+               "K562_exp2_DIA",
+               "K562_exp3_DIA_std_sonication",
+               "K562_exp3_DIA_4xsonication",
+               "mESC",
+               "Hela_nuc")
+
+# run_index <- c("Hela_nuc","Hela_nuc")
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+
+
+peplist <- my_rename(peplist,
+                      "K562_exp1_DIA_std_sonication" = "K562_exp1_DIA",
+                      "K562_exp2_DIA_benzonase" = "K562_exp2_DIA",
+                      "mESC_2016_mol_cell" = "mESC",
+                      "Hela_2019_Richard" = "Hela_nuc")
+
+#set up nested parallel cluster
+setupCluster(peplist, cores)
+
+plots <- future_imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+  filt <- rbrid[rbrid$peptides_detected > 2,]
+
+  FDR = T #set FDR comparison as true
+  if (grepl("mESC", dataset)) {
+    FDR = F
+  }
+
+  #p cutoff
+  cutoff = 0.05
+
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+
+   #for Hela data, relax cutoff to 10% FDR b/c there are only 6 replicates
+  if(dataset == "Hela_nuc") {
+    cutoff = 0.1
+  }
+  #if using pseudocount use much lower FDR cutoff
+  if(dataset == "Hela_nuc_pseudo" | dataset == "Hela_nuc_pseudo_prot") {
+    cutoff = 0.01
+  }
+    if(dataset == "K562_exp2_DIA" | dataset == "K562_exp2_DDA") {
+    FDR = T
+  }
+  
+
+  if (FDR) {
+    filt.hits <- filt %>%
+      filter(log2fold < 0 & padj < cutoff)# then find hits
+    } else {
+  filt.hits <- filt %>%
+    filter(log2fold < 0 & pval < cutoff)# then find hits
+  }
+
+# Count number of proteins in various groups
+n.prot     <- length(unique(filt$uniprotID))
+n.TFs      <- length(unique(filt$whitehead_TF))-1 # Because one of them is ""
+n.hits     <- length(unique(filt.hits$uniprotID))
+overlap    <- filt.hits %>%
+  filter(whitehead_TF != "") %>%
+  pull(symbol) %>%
+  unique() %>%
+  length()
+
+# Overlaps
+  pval <- phyper(q = overlap-1,
+                 m = n.hits,
+                 n = n.prot-n.hits,
+                 k = n.TFs,
+                 lower.tail = F) %>%
+    signif(., digits = 3)
+
+    venn <- draw.pairwise.venn(area1 = n.hits,
+                       area2 = n.TFs,
+                       cross.area = overlap,
+                       col = "black",
+                       fill = c("salmon", "deepskyblue2"),
+                       category = c("Primary hits", "TFs (≥3 peptides)"),
+                       scaled = T,
+                       cex = 1,
+                       fontfamily = "arial",
+                       cat.fontfamily = "arial",
+                       cat.pos = c(340, 180),
+                       cat.dist = c(0.05, 0.1),
+                       cat.cex = 1,
+                       ind = F)
+  #format titles
+  FDR_title <- case_when(FDR == T ~ paste0("+FDR padj <", cutoff),
+                         FDR == F ~ paste0("no FDR pval <", cutoff))
+  title <- paste(dataset, FDR_title)
+
+  out <- arrangeGrob(gTree(children = venn), # Add title & subtitle
+               top = textGrob(paste0(title, "\p = ", pval),
+                                     gp = gpar(col = "black", fontsize = 15)),
+               heights = c(5,1)) #size of venn relative to title
+
+return(out)
+})
+
+grid.arrange(top = "K562 RBRID overlap with TFs",
+             grobs = plots,
+             nrow = 3)
+```
+
+##  Fig 02_4: RRM protein & RBR overlap
+
+Plot venn diagram of overlap with RRM-containing proteins
+
+```{r venn2, eval = T}
+# specify samples to analyse
+# run_index <- c("K562", "mESC", "HepG2", "Hela_nuc")
+# run_index <- c("Hela_nuc","Hela_nuc")
+run_index <- c("K562_exp1_DIA",
+               "K562_exp1_DIA_rwtSearch")
+               # "K562_exp2_DIA",
+               # "K562_exp3_DIA_std_sonication",
+               # "K562_exp3_DIA_4xsonication",
+               # "mESC",
+               # "Hela_nuc")
+
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))#[run_index]
+
+# names(peplist) <- c("Hela_nuc", "Hela_nuc_fisher")
+
+dataset <- "K562_original"
+rbrid <- peplist[[dataset]]
+
+plots <- imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+
+  filt <- rbrid[rbrid$peptides_detected > 2,]
+  RRM="IPR000504"
+  filt$RRM <- grepl(RRM, filt$interpro_protein)
+
+  #p cutoff
+  cutoff = 0.05
+
+  FDR = T #set FDR comparison as true
+  if (dataset %in% c("mESC")) {
+    FDR = F
+  }
+
+
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+
+  #for Hela data, relax cutoff to 10% FDR b/c there are only 6 replicates
+  if(trim_name == "Hela") {
+    cutoff = 0.1
+
+  }
+
+
+  if (FDR) {
+    filt.hits <- filt %>%
+      filter(log2fold < 0 & padj < cutoff)# then find hits
+    } else {
+  filt.hits <- filt %>%
+    filter(log2fold < 0 & pval < cutoff)# then find hits
+  }
+
+# Count number of proteins in various groups
+n.prot     <- length(unique(filt$uniprotID))
+n.RRMs      <- length(unique(filt$uniprotID[filt$RRM]))
+n.hits     <- length(unique(filt.hits$uniprotID))
+overlap    <- filt.hits %>%
+  filter(RRM) %>%
+  pull(symbol) %>%
+  unique() %>%
+  length()
+
+# Overlaps
+  pval <- phyper(q = overlap-1,
+                 m = n.hits,
+                 n = n.prot-n.hits,
+                 k = n.RRMs,
+                 lower.tail = F) %>%
+    signif(., digits = 3)
+
+    venn <- draw.pairwise.venn(area1 = n.hits,
+                       area2 = n.RRMs,
+                       cross.area = overlap,
+                       col = "black",
+                       fill = c("salmon", "deepskyblue2"),
+                       category = c("Primary hits", ""),
+                       scaled = T,
+                       cex = 1,
+                       fontfamily = "arial",
+                       cat.fontfamily = "arial",
+                       cat.pos = c(340, 180),
+                       cat.dist = c(0.05, 0.1),
+                       cat.cex = 1,
+                       ind = F)
+  #format titles
+  FDR_title <- case_when(FDR == T ~ paste0("+FDR padj <", cutoff),
+                         FDR == F ~ paste0("no FDR pval <", cutoff))
+  title <- dataset
+
+  out <- arrangeGrob(gTree(children = venn), # Add title & subtitle
+               top = textGrob(paste0(title, "\np = ", pval),
+                                     gp = gpar(col = "black", fontsize = 15)),
+               heights = c(5,1)) #size of venn relative to title
+
+return(out)
+})
+
+grid.arrange(grobs =plots,
+             bottom = textGrob("Proteins containing RRM Domains ≥3 peptides",
+                      gp = gpar(col = "deepskyblue2", fontsize = 15)),
+             nrow = 2)
+```
+
+##  Fig 02_5: RRM KH dsRBD
+Plot venn diagram of overlap with RRM / KH / dsRDB containing proteins
+
+```{r venn3, eval = T}
+RRM="IPR000504" #RNA-Recognition Motif IPR
+dsRBD="IPR014720"
+KH="IPR004087"
+rbds <- paste(c(RRM, dsRBD, KH), collapse = "|")
+
+# specify samples to analyse
+# run_index <- c("K562", "mESC", "HepG2", "Hela_nuc")
+# run_index <- c("Hela_nuc","Hela_nuc")
+run_index <- c("K562_exp1_DIA",
+               "K562_exp1_DIA_rwtSearch")
+               # "K562_exp2_DIA",
+               # "K562_exp3_DIA_std_sonication",
+               # "K562_exp3_DIA_4xsonication",
+               # "mESC",
+               # "Hela_nuc")
+
+peplist <- readRDS(file.path(wd, "rds", "BR09_02_anno.IPR.wh.prot_rbd.quant.rds"))#[run_index]
+
+# names(peplist) <- c("Hela_nuc", "Hela_nuc_fisher")
+
+dataset <- "K562_original"
+rbrid <- peplist[[dataset]]
+
+plots <- imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+
+  filt <- rbrid[rbrid$peptides_detected > 2,]
+  filt$RBD <- grepl(rbds, filt$interpro_protein)
+
+  #p cutoff
+  cutoff = 0.05
+
+  FDR = T #set FDR comparison as true
+  if (dataset %in% c("mESC")) {
+    FDR = F
+  }
+
+
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+
+  #for Hela data, relax cutoff to 10% FDR b/c there are only 6 replicates
+  if(trim_name == "Hela") {
+    cutoff = 0.1
+
+  }
+
+
+  if (FDR) {
+    filt.hits <- filt %>%
+      filter(log2fold < 0 & padj < cutoff)# then find hits
+    } else {
+  filt.hits <- filt %>%
+    filter(log2fold < 0 & pval < cutoff)# then find hits
+  }
+
+# Count number of proteins in various groups
+n.prot     <- length(unique(filt$uniprotID))
+n.RBD     <- length(unique(filt$uniprotID[filt$RBD]))
+n.hits     <- length(unique(filt.hits$uniprotID))
+overlap    <- filt.hits %>%
+  filter(RBD) %>%
+  pull(symbol) %>%
+  unique() %>%
+  length()
+
+# Overlaps
+  pval <- phyper(q = overlap-1,
+                 m = n.hits,
+                 n = n.prot-n.hits,
+                 k = n.RBD,
+                 lower.tail = F) %>%
+    signif(., digits = 3)
+
+    venn <- draw.pairwise.venn(area1 = n.hits,
+                       area2 = n.RBD,
+                       cross.area = overlap,
+                       col = "black",
+                       fill = c("salmon", "deepskyblue2"),
+                       category = c("Primary hits", ""),
+                       scaled = T,
+                       cex = 1,
+                       fontfamily = "arial",
+                       cat.fontfamily = "arial",
+                       cat.pos = c(340, 180),
+                       cat.dist = c(0.05, 0.1),
+                       cat.cex = 1,
+                       ind = F)
+  #format titles
+  FDR_title <- case_when(FDR == T ~ paste0("+FDR padj <", cutoff),
+                         FDR == F ~ paste0("no FDR pval <", cutoff))
+  title <- dataset
+
+  out <- arrangeGrob(gTree(children = venn), # Add title & subtitle
+               top = textGrob(paste0(title, "\np = ", pval),
+                                     gp = gpar(col = "black", fontsize = 15)),
+               heights = c(5,1)) #size of venn relative to title
+
+return(out)
+})
+
+grid.arrange(grobs =plots,
+             bottom = textGrob("Proteins containing RRM | KH | dsRBD Domains ≥3 peptides",
+                      gp = gpar(col = "deepskyblue2", fontsize = 25)),
+             nrow = 2)
+```
+
+##  Fig 02_6: Interpro RBD protein & RBR overlap
+
+Plot venn diagram of overlap with RBDs identified from Interpro database
+
+```{r venn02_6, eval = F}
+tic()
+# specify samples to analyse
+# run_index <- c("K562", "mESC", "HepG2", "Hela_nuc")
+#load data
+run_index <- c("K562_exp1_DIA",
+               "K562_exp1_DIA_rwtSearch")
+               # "K562_exp2_DIA",
+               # "K562_exp3_DIA_std_sonication",
+               # "K562_exp3_DIA_4xsonication",
+               # "mESC",
+               # "Hela_nuc")
+
+# run_index <- c("Hela_nuc","Hela_nuc")
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))#[run_index]
+annodb <- readRDS(file.path(anno.dir, "220627_annodb.hsapiens.mmus.TF.RDS"))
+
+# names(peplist) <- c("Hela_nuc", "Hela_nuc_fisher")
+
+rbrid <- peplist$K562
+dataset <- "K562"
+
+plots <- future_imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+
+
+  filt <- rbrid[rbrid$peptides_detected > 2,]
+
+  #p cutoff
+  cutoff = 0.05
+
+  FDR = T #set FDR comparison as true
+  if (grepl("mESC", dataset)) {
+    FDR = F
+  }
+
+
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+
+  #for Hela data, relax cutoff to 10% FDR b/c there are only 6 replicates
+  if(trim_name == "Hela") {
+    cutoff = 0.1
+  }
+
+  if (FDR) {
+    filt.hits <- filt %>%
+      filter(log2fold < 0 & padj < cutoff)# then find hits
+    } else {
+      filt.hits <- filt %>%
+        filter(log2fold < 0 & pval < cutoff)# then find hits
+  }
+
+# Count number of proteins in various groups
+n.prot     <- length(unique(filt$uniprotID))
+n.RBDs      <- length(unique(filt$uniprotID[filt$protein_contains_RBD]))
+n.hits     <- length(unique(filt.hits$uniprotID))
+overlap    <- filt.hits %>%
+  filter(protein_contains_RBD) %>%
+  pull(symbol) %>%
+  unique() %>%
+  length()
+
+# Overlaps
+  pval <- phyper(q = overlap-1,
+                 m = n.hits,
+                 n = n.prot-n.hits,
+                 k = n.RBDs,
+                 lower.tail = F) %>%
+    signif(., digits = 3)
+
+    venn <- draw.pairwise.venn(area1 = n.hits,
+                       area2 = n.RBDs,
+                       cross.area = overlap,
+                       col = "black",
+                       fill = c("salmon", "deepskyblue2"),
+                       category = c("Primary hits", ""),
+                       scaled = T,
+                       cex = 1,
+                       fontfamily = "arial",
+                       cat.fontfamily = "arial",
+                       cat.pos = c(340, 180),
+                       cat.dist = c(0.05, 0.1),
+                       cat.cex = 1,
+                       ind = F)
+  #format titles
+  FDR_title <- case_when(FDR == T ~ paste0("+FDR padj <", cutoff),
+                         FDR == F ~ paste0("no FDR pval <", cutoff))
+  title <- paste(dataset, FDR_title)
+
+  out <- arrangeGrob(gTree(children = venn), # Add title & subtitle
+               top = textGrob(paste0(title, "\n p = ", pval),
+                                     gp = gpar(col = "black", fontsize = 13)),
+               heights = c(5,1)) #size of venn relative to title
+return(out)
+})
+
+grid.arrange(grobs = plots,
+             bottom = textGrob("Proteins containing Interpro RNA Binding Domains ≥3 peptides",
+                      gp = gpar(col = "deepskyblue2", fontsize = 15)),
+             nrow = 2)
+```
+
+# Global protein-level score plots
+
+## CDF files
+
+```{r CDF, eval = F}
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.quant.rds"))[run_index]
+
+rbrid <- peplist$mESC
+dataset <- "mESC"
+
+cdfplots <- future_imap(peplist, function(rbrid, dataset) {
+ species <- Whatspecies(dataset)
+ trim_name <- gsub(x = dataset, pattern = "_.*", "")
+
+
+# Prepare CDF data frames by normalizing their length
+# make a temp copy to modify and fill mising symbols with uniprot IDs
+  rbrid.temp <- rbrid[rbrid$peptides_detected > 2, ]
+  rbrid.temp$symbol[rbrid.temp$symbol==""] <- rbrid.temp$uniprotID[rbrid.temp$symbol==""]
+
+  # generate protein-level RBR-ID score list
+  red.flat <- rbrid.temp %>%
+    group_by(symbol) %>%
+    arrange(-score) %>%
+    slice_head(n = 1)  %>% # keep the max RBR-ID per each protein
+    ungroup() %>%
+    arrange(score) %>%# Resort based on RBR-ID score %>%
+  mutate(type  = factor(case_when(whitehead_TF != "" ~ "TFs",
+                                  TRUE ~ "All protein"),
+                        levels = c("All protein", "TFs"))) %>%
+  mutate(fraction = 1:length(score)/length(score))
+
+  #subset for TFs
+  TFdata <- red.flat %>%
+              filter(type == "TFs") %>%
+              mutate(fraction = 1:length(score)/length(score))
+
+g <- ggplot(red.flat, aes(x = score, y = fraction)) +
+  geom_line(data = red.flat %>%
+              mutate(type = "All Proteins"),
+            aes(col = type)) +
+  geom_line(data = TFdata, aes(col = type)) +
+  theme_classic() +
+  ggtitle(paste0(trim_name, " CDF curve of max RBR-ID peptide per protein")) +
+  xlab("RBR-ID score") +
+  ylab("Fraction of set") +
+  scale_color_manual(values = c("grey", "blue")) +
+  scale_y_continuous(limits = c(0, 1), breaks = base::seq(0,1,0.2),
+                     labels = scales::label_percent()) +
+  #set x axis to stop at 98% percentile +
+  scale_x_continuous(limits = c(-1,
+                                floor(TFdata$score[which(TFdata$fraction > 0.99)[1]]))
+  )
+return(g)
+})
+```
+
+## Fig 4: CDF of RBR-ID scores
+
+```{r Fig4, eval =F}
+# Plot
+ggarrange(plotlist = cdfplots,
+          nrow = 2,
+          ncol = 2,
+          common.legend = T)
+```
+
+# Output table for collaborators
+
+```{r output_table, eval = F}
+# run_index <- c("K562", "mESC", "HepG2", "Hela_nuc")
+run_index <- "K562_E"
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.quant.rds"))[run_index]
+
+# rbrid <- peplist$Hela_nuc
+# dataset <- "Hela_nuc"
+
+peplist <- imap(peplist, function(rbrid, dataset) {
+
+# Select columns that they need and give them easier to interpret names
+
+out <- rbrid %>% select(uniprotID,
+                        symbol,
+                        whitehead_TF,
+                        synonyms,
+                        protein_name,
+                        sequence,
+                        start,
+                        end,
+                        interpro_peptide,
+                        interpro_protein,
+                        interpro_DBD,
+                        peptides_detected_from_protein = peptides_detected,
+                        pval,
+                        padj,
+                        logFold = log2fold,
+                        score,
+                        minus_4su_observations = minusObs,
+                        plus_4su_observations = plusObs,
+                        test_used) %>%
+  arrange(-score)
+# Save to TSV
+write.table(out, file.path(wd, paste0("output/220629.reannotated.", dataset, ".tsv")), quote = F, row.names = F, sep = "\t")
+
+return(NULL)
+})
+```
+
+## Files for Fig02_7 RBD overlap Venn
+
+
+
+```{r files for Fig02_7, eval = F}
+tic()
+# specify samples to analyse
+# run_index <- c("K562", "mESC", "HepG2", "Hela_nuc")
+peplist <- readRDS(file.path(wd, "rds", "BR09_11_anno.IPR.wh.prot_rbd.signal_quant.rds"))#[run_index]
+
+# peplist <- readRDS(file.path(wd, "rds", "BR09_11.hela.nuc.anno.normpep.list.RDS"))
+
+plots <- future_imap(peplist, function(rbrid, dataset) {
+  # ignore proteins that don't have at least x peptides
+
+  filt <- rbrid[rbrid$peptides_detected > 2,]
+
+  #p cutoff
+  cutoff = 0.05
+  FDR = TRUE
+
+  if (dataset %in% c("mESC")) {
+    FDR = F
+  }
+
+  if(dataset == "Hela_nuc") {
+    cutoff = 0.1
+  }
+  trim_name <- gsub(x = dataset, pattern = "_.*", "")
+  
+  #  if(dataset == "K562_exp2_DIA" | dataset == "K562_exp2_DDA") {
+  #   FDR = F
+  # }
+  
+
+  if (FDR) {
+    filt.hits <- filt %>%
+      filter(log2fold < 0 & padj < cutoff)# then find hits
+    } else {
+  filt.hits <- filt %>%
+    filter(log2fold < 0 & pval < cutoff)# then find hits
+  }
+
+# Count number of proteins in various groups
+n.prot     <- length(unique(filt$uniprotID))
+n.RBDs      <- length(unique(filt$uniprotID[filt$protein_contains_RBD]))
+n.hits     <- length(unique(filt.hits$uniprotID))
+overlap    <- filt.hits %>%
+  filter(protein_contains_RBD) %>%
+  pull(symbol) %>%
+  unique() %>%
+  length()
+
+# Overlaps
+  pval <- phyper(q = overlap-1,
+                 m = n.hits,
+                 n = n.prot-n.hits,
+                 k = n.RBDs,
+                 lower.tail = F) %>%
+    signif(., digits = 3)
+
+    venn <- draw.pairwise.venn(area1 = n.hits,
+                       area2 = n.RBDs,
+                       cross.area = overlap,
+                       col = "black",
+                       fill = c("salmon", "deepskyblue2"),
+                       category = c("Primary hits", "Interpro RBD proteins (≥3 peptides)"),
+                       scaled = T,
+                       cex = 1,
+                       fontfamily = "arial",
+                       cat.fontfamily = "arial",
+                       cat.pos = c(340, 180),
+                       cat.dist = c(0.05, 0.1),
+                       cat.cex = 1,
+                       ind = F)
+  #format titles
+  FDR_title <- case_when(FDR == T ~ paste0("+FDR padj <", cutoff),
+                         FDR == F ~ paste0("no FDR pval <", cutoff))
+  title <- paste(dataset, FDR_title)
+
+  out <- arrangeGrob(gTree(children = venn), # Add title & subtitle
+               top = textGrob(paste0(title, "\noverlap p = ", pval),
+                                     gp = gpar(col = "black", fontsize = 15)),
+               heights = c(5,1)) #size of venn relative to title
+
+return(out)
+})
+toc()
+```
+
+##  Fig02_7: Hela Fisher hits
+```{r Fig02_7, eval = F}
+
+grid.arrange(top = "K562 RBRID overlap with RBD proteins",
+             grobs =plots,
+             nrow = 2)
+
+```
